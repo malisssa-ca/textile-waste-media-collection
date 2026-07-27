@@ -2381,49 +2381,121 @@ def scrape_all(
     ]
     schema_names = pl.scan_parquet(final_path).collect_schema().names()
     available = [column for column in summary_columns if column in schema_names]
-    return pl.scan_parquet(final_path).select(available).collect().to_pandas()
+    summary = pl.scan_parquet(final_path).select(available)
+    if "text_length" not in available and "text" in schema_names:
+        summary = summary.with_columns(
+            pl.col("text").fill_null("").str.len_chars().alias("text_length")
+        )
+    return summary.collect().to_pandas()
 
 
 # ── Stats report ───────────────────────────────────────────────────────────
 
-def write_stats(df_mc: pd.DataFrame, df_sc: pd.DataFrame, out_dir: Path) -> None:
-    """Write a P002-style funnel report to the console and run_statistics.txt."""
-    mc_total  = len(df_mc)
-    s = df_sc["scrape_status"].value_counts(dropna=False) if not df_sc.empty else {}
-    n_ok = s.get("ok", 0)
-    n_tot = len(df_sc) if not df_sc.empty else 0
-    n_verified = (
-        int(df_sc["target_verified"].fillna(False).astype(bool).sum())
-        if not df_sc.empty and "target_verified" in df_sc.columns else 0
+def _country_by_id(df_mc: pd.DataFrame, input_dir: Path) -> pd.Series:
+    """Return the exact Sweden/Germany label for every input MediaCloud ID."""
+    if "media_name" not in df_mc.columns:
+        raise ValueError("Input is missing media_name, required for country statistics")
+    source_path = input_dir / "collections_sources.csv"
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f"{source_path} not found. Country statistics require collections_sources.csv."
+        )
+    sources = pd.read_csv(
+        source_path, encoding="utf-8-sig", usecols=["country", "source_name"]
+    ).dropna(subset=["country", "source_name"])
+    source_counts = sources.groupby("source_name")["country"].nunique()
+    ambiguous = source_counts[source_counts > 1]
+    if not ambiguous.empty:
+        raise ValueError("collections_sources.csv maps some source names to multiple countries")
+    source_country = sources.drop_duplicates("source_name").set_index("source_name")["country"]
+    countries = df_mc["media_name"].map(source_country)
+    if countries.isna().any():
+        examples = ", ".join(df_mc.loc[countries.isna(), "media_name"].drop_duplicates().head(5))
+        raise ValueError(f"No country mapping for input source(s): {examples}")
+    unexpected = sorted(set(countries) - {"Sweden", "Germany"})
+    if unexpected:
+        raise ValueError(f"Unexpected country label(s): {', '.join(unexpected)}")
+    return pd.Series(countries.to_numpy(), index=df_mc["id"].astype(str), dtype="string")
+
+
+def _stats_metrics(df: pd.DataFrame) -> dict[str, int]:
+    """Return descriptive result counts; never alter scraping results."""
+    statuses = df["scrape_status"].value_counts(dropna=False) if not df.empty else {}
+    recovered = int(statuses.get("ok", 0))
+    verified = (
+        int(df["target_verified"].fillna(False).astype(bool).sum())
+        if not df.empty and "target_verified" in df.columns else 0
+    )
+    short_text = 0
+    if not df.empty and "text_length" in df.columns:
+        lengths = pd.to_numeric(df["text_length"], errors="coerce")
+        short_text = int(((df["scrape_status"] == "ok") & (lengths < 500)).sum())
+    return {
+        "final": len(df),
+        "recovered": recovered,
+        "verified": verified,
+        "short_text": short_text,
+        "fetch_error": int(statuses.get("fetch_error", 0)),
+        "extract_error": int(statuses.get("extract_error", 0)),
+        "exception": int(statuses.get("exception", 0)),
+    }
+
+
+def write_stats(
+    df_mc: pd.DataFrame,
+    df_sc: pd.DataFrame,
+    out_dir: Path,
+    country_by_id: pd.Series,
+) -> None:
+    """Write a compact, country-aware description of current scraper outcomes."""
+    overall = _stats_metrics(df_sc)
+    results = df_sc.copy()
+    if not results.empty:
+        results["__country"] = results["id"].astype(str).map(country_by_id)
+    recovered_by_method = (
+        results.loc[results["scrape_status"] == "ok", "fetch_method"].value_counts()
+        if not results.empty and "fetch_method" in results.columns else pd.Series(dtype="int64")
     )
 
     lines = [
-        "=" * 60,
-        "Textile Waste Collection — Run Statistics",
-        "=" * 60,
+        "=" * 72,
+        "Textile Waste Collection - Run Statistics",
+        "=" * 72,
         "",
-        "── Part 1: MediaCloud fetch ─────────────────────────",
-        f"  Stories fetched (total):        {mc_total:>7,}",
+        "Input and results",
+        f"  Total input URLs:               {len(df_mc):>8,}",
+        f"  URLs with final result:         {overall['final']:>8,}",
+        f"  Text recovered:                 {overall['recovered']:>8,}",
+        f"  Target verified:                {overall['verified']:>8,}",
+        f"  Text under 500 characters:      {overall['short_text']:>8,}",
+        f"  Fetch errors:                   {overall['fetch_error']:>8,}",
+        f"  Extraction errors:              {overall['extract_error']:>8,}",
+        f"  Exceptions:                     {overall['exception']:>8,}",
+        "",
+        "Recovered text by final fetch layer",
     ]
-    if "country" in df_mc.columns:
-        for country, n in df_mc["country"].value_counts().items():
-            lines.append(f"    {country:<24}      {n:>7,}")
+    for method in _FETCH_METHODS:
+        lines.append(f"  {method:<14} {int(recovered_by_method.get(method, 0)):>8,}")
 
     lines += [
         "",
-        "── Part 2: Scraping funnel ──────────────────────────",
-        f"  URLs attempted:                 {n_tot:>7,}",
-        f"  fetch_ok (fetch-only mode):     {s.get('fetch_ok', 0):>7,}",
-        f"  fetch_error:                    {s.get('fetch_error',  0):>7,}",
-        f"  extract_error:                  {s.get('extract_error', 0):>7,}",
-        f"  exception:                      {s.get('exception', 0):>7,}",
-        f"  {'─' * 42}",
-        f"  Articles with recovered text:   {n_ok:>7,}  "
-        f"({n_ok / max(n_tot, 1) * 100:.1f}%)",
-        f"  Target article verified:        {n_verified:>7,}",
+        "Country results",
+        "  Country  Input URLs    Final  Recovered  Verified   <500  Fetch err  Extract err  Exception",
+    ]
+    input_country = df_mc["id"].astype(str).map(country_by_id)
+    for country in ("Sweden", "Germany"):
+        metrics = _stats_metrics(results[results["__country"] == country]) if not results.empty else _stats_metrics(pd.DataFrame())
+        lines.append(
+            f"  {country:<8} {int((input_country == country).sum()):>10,} "
+            f"{metrics['final']:>8,} {metrics['recovered']:>10,} {metrics['verified']:>9,} "
+            f"{metrics['short_text']:>6,} {metrics['fetch_error']:>10,} "
+            f"{metrics['extract_error']:>12,} {metrics['exception']:>10,}"
+        )
+
+    lines += [
         "",
         f"Output directory: {out_dir.resolve()}",
-        "=" * 60,
+        "=" * 72,
     ]
 
     report = "\n".join(lines)
@@ -2453,8 +2525,10 @@ def main():
                         help="Layer 5 (Common Crawl) threads")
     parser.add_argument("--skip-scrape", action="store_true",
                         help="Skip scraping; load existing output and print stats only")
+    parser.add_argument("--input-dir", default=".",
+                        help="Directory containing mediacloud_combined.csv and collections_sources.csv")
     parser.add_argument("--output-dir",  default=".",
-                        help="Directory containing mediacloud_combined.csv and all outputs")
+                        help="Directory for all generated outputs, checkpoints, and logs")
     parser.add_argument("--fetch-only",  action="store_true",
                         help="Stop after fetching — skip trafilatura extraction. "
                              "Useful for benchmarking the five-layer fetch cascade.")
@@ -2478,6 +2552,7 @@ def main():
 
     _FETCH_ONLY = args.fetch_only
 
+    input_dir = Path(args.input_dir)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     run_lock = _RunLock(out_dir / "scrape_run.lock")
@@ -2524,7 +2599,7 @@ def main():
     )
 
     try:
-        combined_csv = out_dir / "mediacloud_combined.csv"
+        combined_csv = input_dir / "mediacloud_combined.csv"
         if not combined_csv.exists():
             raise FileNotFoundError(
                 f"{combined_csv} not found. Run textile_waste_p1_mediacloud.py first."
@@ -2537,7 +2612,7 @@ def main():
             raise ValueError(f"Input is missing required columns: {', '.join(missing)}")
         if df_mc["id"].astype(str).duplicated().any():
             raise ValueError("Input contains duplicate MediaCloud IDs; refusing ambiguous resume")
-        log.info(f"Loaded MC data: {len(df_mc):,} stories from {combined_csv.name}")
+        log.info(f"Loaded MC data: {len(df_mc):,} stories from {combined_csv}")
 
         if args.date_from or args.date_to:
             dates = pd.to_datetime(df_mc["publish_date"], errors="coerce")
@@ -2553,6 +2628,7 @@ def main():
                 args.date_to or "*",
                 f"{len(df_mc):,}",
             )
+        country_by_id = _country_by_id(df_mc, input_dir)
 
         if not args.skip_scrape:
             df_sc = scrape_all(
@@ -2580,14 +2656,19 @@ def main():
         else:
             scrape_parquet = out_dir / "trafilatura_scraped.parquet"
             if scrape_parquet.exists():
-                columns = ["id", "url", "scrape_status"]
+                columns = [
+                    "id", "url", "scrape_status", "fetch_method", "text_length",
+                    "target_verified",
+                ]
                 names = pl.scan_parquet(scrape_parquet).collect_schema().names()
-                df_sc = (
-                    pl.scan_parquet(scrape_parquet)
-                    .select([column for column in columns if column in names])
-                    .collect()
-                    .to_pandas()
+                summary = pl.scan_parquet(scrape_parquet).select(
+                    [column for column in columns if column in names]
                 )
+                if "text_length" not in names and "text" in names:
+                    summary = summary.with_columns(
+                        pl.col("text").fill_null("").str.len_chars().alias("text_length")
+                    )
+                df_sc = summary.collect().to_pandas()
             else:
                 df_sc = pd.DataFrame()
             log.info(f"Loaded existing scrape summary: {len(df_sc):,} rows")
@@ -2610,7 +2691,7 @@ def main():
 
         log.info("Failure lists updated atomically: %s failed", f"{len(failed_urls):,}")
 
-        write_stats(df_mc, df_sc, out_dir)
+        write_stats(df_mc, df_sc, out_dir, country_by_id)
         run_state.update({
             "status": "completed",
             "completed_at": datetime.now(timezone.utc).isoformat(),
