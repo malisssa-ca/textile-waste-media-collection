@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Recover full article text from URLs in ``mediacloud_combined.csv``.
+Recover full article text from the URLs in ``mediacloud_combined.csv``.
 
-Requests, Playwright, and Wayback provide a bounded three-source fetch cascade.
-Structured article bodies, optional publisher-specific Fundus parsers, scoped
-Trafilatura, and whole-page Trafilatura extract every nonempty candidate without
-length or phrase filtering. Atomic checkpoints preserve progress across crashes,
-and final UTF-8 results are written to Parquet, CSV, and JSON without text limits.
+Choose one run mode:
 
-Run ``python textile_waste_p2_scrape.py`` or use ``--help`` for options.
+* ``complete`` (the normal choice): try the live page first, then a browser,
+  then the Internet Archive if needed. A definite live 404/410 skips the
+  browser and goes straight to the Internet Archive.
+* ``live-only``: try only the live page and browser. Use this when you want a
+  fast first pass. Rows still needing archive recovery are saved for later.
+* ``archive-only``: process only those saved pending rows through the Internet
+  Archive. It never repeats the live-page or browser work.
+
+All modes reuse the same output folder and checkpoints, so restarting does not
+repeat completed work. For each page found, the script tries several article
+text extractors and records how confidently the text matches the requested
+article: ``strict_verified``, ``page_verified``, ``unverified_text``, or
+``no_text``. Full article results are saved to Parquet; small JSON files record
+run state, metrics, and failed URLs.
+
+Run: ``python textile_waste_p2_scrape.py --mode complete``
+Use ``--help`` to see input/output and worker options.
 """
 
 # ── Imports ────────────────────────────────────────────────────────────────
@@ -35,7 +47,6 @@ from urllib.parse import quote, urljoin, urlparse, urlunparse
 
 import pandas as pd
 import polars as pl
-import pyarrow.parquet as pq
 import requests
 import trafilatura
 from lxml import html as lxml_html
@@ -1502,53 +1513,12 @@ def _commit_primary_output(temp: Path, target: Path) -> None:
         raise
 
 
-def _stream_json_array(parquet_path: Path, json_path: Path) -> None:
-    """Export JSON in bounded batches so article text is never loaded all at once."""
-    temp = json_path.with_name(f".{json_path.name}.tmp")
-    with temp.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write("[\n")
-        first = True
-        for batch in pq.ParquetFile(parquet_path).iter_batches(batch_size=256):
-            for row in batch.to_pylist():
-                if not first:
-                    handle.write(",\n")
-                json.dump(row, handle, ensure_ascii=False, default=str)
-                first = False
-        handle.write("\n]\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp, json_path)
-
-
-def _merge_outputs(out_dir: Path, export_csv: bool, export_json: bool) -> Path:
+def _merge_outputs(out_dir: Path) -> Path:
     """Deduplicate and atomically merge the primary output plus checkpoints."""
     out_parquet = out_dir / "trafilatura_scraped.parquet"
-    out_csv = out_dir / "trafilatura_scraped.csv"
-    out_json = out_dir / "trafilatura_scraped.json"
     _recover_primary_output(out_parquet)
     checkpoint_files = sorted(out_dir.glob("_ckpt_*.parquet"))
     if out_parquet.exists() and not checkpoint_files:
-        parquet_mtime = out_parquet.stat().st_mtime_ns
-        csv_has_bom = False
-        if out_csv.exists():
-            with out_csv.open("rb") as handle:
-                csv_has_bom = handle.read(3) == b"\xef\xbb\xbf"
-        csv_current = (
-            out_csv.exists()
-            and out_csv.stat().st_mtime_ns >= parquet_mtime
-            and csv_has_bom
-        )
-        json_current = out_json.exists() and out_json.stat().st_mtime_ns >= parquet_mtime
-        if export_csv and not csv_current:
-            temp_csv = out_dir / ".trafilatura_scraped.csv.tmp"
-            if temp_csv.exists():
-                temp_csv.unlink()
-            pl.scan_parquet(out_parquet).sink_csv(temp_csv, include_bom=True)
-            os.replace(temp_csv, out_csv)
-            log.info("Regenerated missing or stale CSV export")
-        if export_json and not json_current:
-            _stream_json_array(out_parquet, out_json)
-            log.info("Regenerated missing or stale JSON export")
         log.info("No new checkpoints; canonical Parquet remains unchanged")
         return out_parquet
     sources = ([out_parquet] if out_parquet.exists() else []) + checkpoint_files
@@ -1648,16 +1618,7 @@ def _merge_outputs(out_dir: Path, export_csv: bool, export_json: bool) -> Path:
         )
     _commit_primary_output(temp_parquet, out_parquet)
 
-    if export_csv:
-        temp_csv = out_dir / ".trafilatura_scraped.csv.tmp"
-        if temp_csv.exists():
-            temp_csv.unlink()
-        pl.scan_parquet(out_parquet).sink_csv(temp_csv, include_bom=True)
-        os.replace(temp_csv, out_csv)
-    if export_json:
-        _stream_json_array(out_parquet, out_json)
-
-    # Checkpoints are deleted only after every requested final export succeeds.
+    # Checkpoints are deleted only after the canonical Parquet commit succeeds.
     for checkpoint in checkpoint_files:
         checkpoint.unlink()
     log.info("Final atomic merge — %s unique rows saved", f"{rows:,}")
@@ -1705,8 +1666,6 @@ def scrape_all(
     *,
     mode: str = "complete",
     limit: int | None = None,
-    export_csv: bool = True,
-    export_json: bool = True,
 ) -> pd.DataFrame:
     """Run the requests -> Playwright -> Wayback three-source cascade."""
     if mode not in {"complete", "live-only", "archive-only"}:
@@ -1958,7 +1917,7 @@ def scrape_all(
             thread.join(timeout=10)
     with save_lock:
         checkpoint()
-    final_path = _merge_outputs(out_dir, export_csv=export_csv, export_json=export_json)
+    final_path = _merge_outputs(out_dir)
     metrics = _metrics_snapshot()
     _atomic_write_text(out_dir / "run_metrics.json", json.dumps(metrics, indent=2), encoding="utf-8")
     for group, rows in metrics.items():
@@ -2131,10 +2090,6 @@ def main():
                         help="Only scrape articles published on or before this date")
     parser.add_argument("--limit", type=int, default=None, metavar="N",
                         help="Process at most N pending URLs (for a small validation run)")
-    parser.add_argument("--no-csv", action="store_true",
-                        help="Skip the final CSV export; Parquet remains canonical")
-    parser.add_argument("--no-json", action="store_true",
-                        help="Skip the final JSON export; Parquet remains canonical")
     args = parser.parse_args()
 
     if args.limit is not None and args.limit < 1:
@@ -2230,8 +2185,6 @@ def main():
                 SCRAPE_SAVE_EVERY,
                 mode=args.mode,
                 limit=args.limit,
-                export_csv=not args.no_csv,
-                export_json=not args.no_json,
             )
             if args.limit is None:
                 expected_ids = set(df_mc["id"].astype(str))
