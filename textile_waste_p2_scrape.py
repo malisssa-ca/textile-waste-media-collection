@@ -77,7 +77,13 @@ _RUN_ID = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
 
 def _system_resources() -> tuple[int, float, float]:
     """Return logical CPUs plus total/available physical memory in GiB."""
-    cpus = os.cpu_count() or 4
+    # On Slurm, respect the CPU allocation rather than the whole node shown by
+    # os.cpu_count().  This makes the default browser concurrency follow an
+    # updated --cpus-per-task request.
+    try:
+        cpus = int(os.environ.get("SLURM_CPUS_PER_TASK") or "")
+    except ValueError:
+        cpus = os.cpu_count() or 4
     if sys.platform == "win32":
         class _MemoryStatusEx(ctypes.Structure):
             _fields_ = [
@@ -113,9 +119,10 @@ def _system_resources() -> tuple[int, float, float]:
 _CPU_COUNT, _RAM_TOTAL_GIB, _RAM_AVAILABLE_GIB = _system_resources()
 
 # Playwright stays memory-aware because every worker owns an independent browser
-# process. Requests and Wayback are I/O-bound.
+# process. Requests and Wayback are I/O-bound. Use half of the allocated CPUs
+# for browser workers; the submission script can still select an explicit value.
 WORKERS_L1 = min(32, max(8, round(_CPU_COUNT * 2.25)))
-WORKERS_L3 = 2 if _RAM_TOTAL_GIB >= 12 and _RAM_AVAILABLE_GIB >= 2 else 1
+WORKERS_L3 = max(1, _CPU_COUNT // 2) if _RAM_AVAILABLE_GIB >= 8 else 1
 WORKERS_L4 = 4 if _CPU_COUNT >= 8 else 2
 
 SCRAPE_SAVE_EVERY = 1000
@@ -206,7 +213,6 @@ class _ScrapeJob(TypedDict):
     fallback: dict[str, Any] | None
     had_fetch: bool
     last_outcome: _FetchOutcome | None
-    needs_archive: bool
 
 
 @dataclass(frozen=True)
@@ -287,7 +293,9 @@ def _get_session(source: str = "requests") -> requests.Session:
             backoff_factor=0,
             status_forcelist=(429, 502, 503, 504),
             allowed_methods=frozenset({"GET"}),
-            respect_retry_after_header=True,
+            # Do not let an arbitrary server Retry-After value override the
+            # bounded retry policy and hold a worker for minutes or hours.
+            respect_retry_after_header=False,
             raise_on_status=False,
         )
         adapter = HTTPAdapter(
@@ -395,7 +403,9 @@ def _get_pw_browser():
                 for channel in PLAYWRIGHT_CHANNELS:
                     try:
                         browser = instance.chromium.launch(
-                            headless=True, channel=channel
+                            headless=True,
+                            channel=channel,
+                            timeout=PLAYWRIGHT_TIMEOUT_S * 1000,
                         )
                         break
                     except Exception as exc:
@@ -417,40 +427,31 @@ def _get_pw_browser():
     return _pw_thread_local.browser
 
 
-def _get_pw_context():
-    """Return one isolated, cookie-preserving context owned by this worker."""
-    if not hasattr(_pw_thread_local, "context"):
-        context = _get_pw_browser().new_context(
-            viewport={"width": 1280, "height": 720},
-            user_agent=_BROWSER_HEADERS["User-Agent"],
-            locale="en-US",
-            service_workers="block",
-        )
-        context.route(
-            "**/*",
-            lambda route: (
-                route.abort()
-                if route.request.resource_type in {"image", "media", "font"}
-                else route.continue_()
-            ),
-        )
-        _pw_thread_local.context = context
-    return _pw_thread_local.context
+def _new_pw_context():
+    """Create one isolated browser context for one URL."""
+    context = _get_pw_browser().new_context(
+        viewport={"width": 1280, "height": 720},
+        user_agent=_BROWSER_HEADERS["User-Agent"],
+        locale="en-US",
+        service_workers="block",
+    )
+    context.set_default_timeout(PLAYWRIGHT_TIMEOUT_S * 1000)
+    context.set_default_navigation_timeout(PLAYWRIGHT_TIMEOUT_S * 1000)
+    context.route(
+        "**/*",
+        lambda route: (
+            route.abort()
+            if route.request.resource_type in {"image", "media", "font"}
+            else route.continue_()
+        ),
+    )
+    return context
 
 
 def _close_pw_browser() -> None:
     """Close the Playwright objects owned by the current worker thread."""
-    context = getattr(_pw_thread_local, "context", None)
     browser = getattr(_pw_thread_local, "browser", None)
     instance = getattr(_pw_thread_local, "instance", None)
-    try:
-        if context is not None:
-            context.close()
-    except Exception as exc:
-        log.debug(f"playwright context cleanup failed: {exc!r}")
-    finally:
-        if hasattr(_pw_thread_local, "context"):
-            del _pw_thread_local.context
     try:
         if browser is not None:
             browser.close()
@@ -474,9 +475,11 @@ def _l3_fetch(url: str) -> _FetchOutcome:
     _enforce_rate_limit(urlparse(url).netloc)
     if not PLAYWRIGHT_AVAILABLE:
         return _FetchOutcome(error="dependency_unavailable", source_url=url)
-    page = None
+    context = None
+    log.debug("Playwright start: %s", url)
     try:
-        page = _get_pw_context().new_page()
+        context = _new_pw_context()
+        page = context.new_page()
         resp = page.goto(url, timeout=PLAYWRIGHT_TIMEOUT_S * 1000, wait_until="domcontentloaded")
         if not resp:
             return _FetchOutcome(error="no_navigation_response", source_url=url)
@@ -501,7 +504,7 @@ def _l3_fetch(url: str) -> _FetchOutcome:
             for selector in consent_selectors:
                 try:
                     locator = frame.locator(selector).first
-                    if locator.count() and locator.is_visible(timeout=300):
+                    if locator.is_visible(timeout=300):
                         locator.click(timeout=1_500)
                         consent_clicked = True
                         break
@@ -511,7 +514,7 @@ def _l3_fetch(url: str) -> _FetchOutcome:
                 break
             try:
                 locator = frame.get_by_role("button", name=_CONSENT_BUTTON_RE).first
-                if locator.count() and locator.is_visible(timeout=300):
+                if locator.is_visible(timeout=300):
                     locator.click(timeout=1_500)
                     consent_clicked = True
                     break
@@ -529,7 +532,13 @@ def _l3_fetch(url: str) -> _FetchOutcome:
             )
         except Exception:
             pass
-        content = page.content()
+        # page.content() has no timeout parameter. Capture the identical document
+        # through a locator operation so a stalled renderer is bounded by the
+        # configured Playwright timeout instead of occupying a worker forever.
+        content = page.locator("html").evaluate(
+            "node => '<!doctype html>\\n' + node.outerHTML",
+            timeout=PLAYWRIGHT_TIMEOUT_S * 1000,
+        )
         return _FetchOutcome(
             content=content or None,
             final_url=page.url,
@@ -541,11 +550,12 @@ def _l3_fetch(url: str) -> _FetchOutcome:
         log.debug(f"playwright failed on {url}: {exc!r}")
         return _FetchOutcome(error=_error_name(exc), source_url=url)
     finally:
-        if page is not None:
+        if context is not None:
             try:
-                page.close()
+                context.close()
             except Exception as exc:
-                log.debug(f"playwright page cleanup failed for {url}: {exc!r}")
+                log.debug(f"playwright context cleanup failed for {url}: {exc!r}")
+        log.debug("Playwright finish: %s", url)
 
 
 def _publication_timestamp(value) -> str | None:
@@ -953,6 +963,55 @@ def _page_metadata(tree, base_url: str) -> dict:
     }
 
 
+_SOURCE_ARTICLE_LINK_RE = re.compile(r"^\s*läs\s+mer\s+på\b", re.IGNORECASE)
+_ORIGINAL_ARTICLE_CONTEXT_RE = re.compile(
+    r"^\s*das\s+original\s+zu\s+diesem\s+beitrag\b", re.IGNORECASE
+)
+
+
+def _source_article_url(tree, base_url: str) -> str | None:
+    """Return an explicitly labelled external link to an original article.
+
+    ``final_url`` already records automatic HTTP redirects. This deliberately
+    narrow helper recognises only labels observed in the former-run text: the
+    Pressen ``Läs mer på …`` link and Focus's explicit ``Das Original zu diesem
+    Beitrag …`` attribution. It does not fetch the link.
+    """
+    base_identity = _normalize_url_identity(base_url)
+    if base_identity is None:
+        return None
+    try:
+        anchors = tree.xpath("//a[@href]")
+    except Exception:
+        return None
+    for anchor in anchors:
+        try:
+            label = " ".join(anchor.text_content().split())
+            href = str(anchor.get("href") or "").strip()
+        except Exception:
+            continue
+        if not href:
+            continue
+        try:
+            context = " ".join(anchor.getparent().text_content().split())
+        except Exception:
+            context = ""
+        if not (
+            _SOURCE_ARTICLE_LINK_RE.match(label)
+            or _ORIGINAL_ARTICLE_CONTEXT_RE.match(context)
+        ):
+            continue
+        candidate = urljoin(base_url, href)
+        candidate_identity = _normalize_url_identity(candidate)
+        if (
+            candidate_identity is not None
+            and candidate_identity[0] != base_identity[0]
+            and urlparse(candidate).scheme in {"http", "https"}
+        ):
+            return candidate
+    return None
+
+
 def _identity_sources(
     row: dict,
     base_url: str,
@@ -1144,7 +1203,8 @@ _SCRAPE_DEFAULTS: dict = {
     "http_status": None, "fetch_error": None, "capture_time": None,
     "target_verified": False, "verified_by": None,
     "verification_level": "no_text", "needs_archive": False,
-    "canonical_url": None, "structured_url": None, "structured_title": None,
+    "canonical_url": None, "source_article_url": None,
+    "structured_url": None, "structured_title": None,
     "fundus_publisher": None, "fundus_free_access": None,
     "pipeline_version": PIPELINE_VERSION,
     "pipeline_run_id": _RUN_ID, "completed_at": None,
@@ -1230,6 +1290,7 @@ def _build_result(
 
     page_meta = _page_metadata(tree, url)
     result["canonical_url"] = page_meta["canonical"]
+    result["source_article_url"] = _source_article_url(tree, url)
     try:
         _apply_traf_metadata(result, _traf_extract_metadata(tree, default_url=url))
     except Exception as exc:
@@ -1670,8 +1731,12 @@ def scrape_all(
     """Run the requests -> Playwright -> Wayback three-source cascade."""
     if mode not in {"complete", "live-only", "archive-only"}:
         raise ValueError("mode must be complete, live-only, or archive-only")
-    if any(value < 1 for value in (workers_l1, workers_l3, workers_l4)):
-        raise ValueError("workers must be at least 1")
+    if any(value < 0 for value in (workers_l1, workers_l3, workers_l4)):
+        raise ValueError("workers cannot be negative")
+    if mode != "archive-only" and (workers_l1 < 1 or workers_l3 < 1):
+        raise ValueError("requests and Playwright workers must be at least 1 in live modes")
+    if mode != "live-only" and workers_l4 < 1:
+        raise ValueError("Wayback workers must be at least 1 in archive modes")
     if save_every < 1:
         raise ValueError("save_every must be at least 1")
 
@@ -1713,8 +1778,70 @@ def scrape_all(
     new_results: list[dict] = []
     save_lock = threading.Lock()
     last_checkpoint_at = time.monotonic()
+    fatal_event = threading.Event()
+    fatal_lock = threading.Lock()
+    fatal_errors: list[tuple[str, str, BaseException]] = []
     checkpoint_index = max((int(p.stem.rsplit("_", 1)[1]) for p in checkpoint_files
                             if p.stem.rsplit("_", 1)[1].isdigit()), default=-1) + 1
+
+    def record_fatal(stage: str, job: _ScrapeJob | None, exc: BaseException) -> None:
+        """Record the first unexpected worker failure for the main thread."""
+        url = str(job["row"].get("url", "")) if job is not None else ""
+        with fatal_lock:
+            if not fatal_errors:
+                fatal_errors.append((stage, url, exc))
+                log.error(
+                    "%s worker failed on %s; stopping this run safely",
+                    stage,
+                    url or "an unknown URL",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+        fatal_event.set()
+
+    def raise_if_fatal() -> None:
+        if not fatal_event.is_set():
+            return
+        with fatal_lock:
+            stage, url, exc = fatal_errors[0]
+        detail = f" while processing {url}" if url else ""
+        raise RuntimeError(f"{stage} worker failed{detail}: {_error_name(exc)}") from exc
+
+    def enqueue(target: queue.Queue, item, stage: str) -> None:
+        """Bound queue backpressure so a stalled downstream stage is visible."""
+        deadline = time.monotonic() + CHECKPOINT_MAX_AGE_S
+        while True:
+            raise_if_fatal()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"{stage} queue accepted no work for {CHECKPOINT_MAX_AGE_S}s"
+                )
+            try:
+                target.put(item, timeout=min(1.0, remaining))
+                return
+            except queue.Full:
+                continue
+
+    def wait_for_stage(target: queue.Queue, stage: str) -> None:
+        """Wait for progress, but never wait forever on dead or stalled workers."""
+        with target.all_tasks_done:
+            previous = target.unfinished_tasks
+        last_progress = time.monotonic()
+        while previous:
+            raise_if_fatal()
+            with target.all_tasks_done:
+                if target.unfinished_tasks:
+                    target.all_tasks_done.wait(timeout=1.0)
+                current = target.unfinished_tasks
+            if current < previous:
+                previous = current
+                last_progress = time.monotonic()
+                continue
+            if time.monotonic() - last_progress >= CHECKPOINT_MAX_AGE_S:
+                raise RuntimeError(
+                    f"{stage} made no progress for {CHECKPOINT_MAX_AGE_S}s; "
+                    "aborting so the next run can resume from checkpoints"
+                )
 
     def checkpoint() -> None:
         nonlocal checkpoint_index, last_checkpoint_at
@@ -1747,7 +1874,7 @@ def scrape_all(
     def new_job(row: dict, fallback: dict | None = None) -> _ScrapeJob:
         return {"row": {**row, "id": str(row.get("id", ""))}, "attempts": [], "trace": [],
                 "archive_urls": [row.get("url")], "fallback": fallback, "had_fetch": False,
-                "last_outcome": None, "needs_archive": False}
+                "last_outcome": None}
 
     def trace(job: _ScrapeJob, method: str, outcome: _FetchOutcome) -> None:
         job["trace"].append({key: value for key, value in {
@@ -1804,6 +1931,8 @@ def scrape_all(
             try:
                 if job is None:
                     return
+                if fatal_event.is_set():
+                    continue
                 outcome = timed_fetch(job, "requests", _l1_fetch)
                 if outcome.content is not None:
                     accepted = process(job, "requests", outcome)
@@ -1811,16 +1940,16 @@ def scrape_all(
                         _metric("fetch", "requests", terminal=True, attempt=False)
                         save(accepted, pbar)
                     else:
-                        q3.put(job)
+                        enqueue(q3, job, "Playwright")
                 elif outcome.status_code in {404, 410}:
                     if mode == "live-only":
                         save(finalize(job, needs_archive=True), pbar)
                     else:
-                        q4.put(job)
-                elif mode == "live-only":
-                    save(finalize(job, needs_archive=True), pbar)
+                        enqueue(q4, job, "Wayback")
                 else:
-                    q3.put(job)
+                    enqueue(q3, job, "Playwright")
+            except BaseException as exc:
+                record_fatal("requests", job, exc)
             finally:
                 q1.task_done()
 
@@ -1831,6 +1960,8 @@ def scrape_all(
                 try:
                     if job is None:
                         return
+                    if fatal_event.is_set():
+                        continue
                     outcome = timed_fetch(job, "playwright", _l3_fetch)
                     if outcome.content is not None:
                         accepted = process(job, "playwright", outcome)
@@ -1840,11 +1971,13 @@ def scrape_all(
                         elif mode == "live-only":
                             save(finalize(job, needs_archive=True), pbar)
                         else:
-                            q4.put(job)
+                            enqueue(q4, job, "Wayback")
                     elif mode == "live-only":
                         save(finalize(job, needs_archive=True), pbar)
                     else:
-                        q4.put(job)
+                        enqueue(q4, job, "Wayback")
+                except BaseException as exc:
+                    record_fatal("Playwright", job, exc)
                 finally:
                     q3.task_done()
         finally:
@@ -1856,6 +1989,8 @@ def scrape_all(
             try:
                 if job is None:
                     return
+                if fatal_event.is_set():
+                    continue
                 if not _wayback_allowed():
                     trace(job, "wayback", _FetchOutcome(error="circuit_open"))
                     save(finalize(job, needs_archive=True), pbar)
@@ -1885,36 +2020,52 @@ def scrape_all(
                     save(accepted, pbar)
                 else:
                     save(finalize(job, needs_archive=deferred), pbar)
+            except BaseException as exc:
+                record_fatal("Wayback", job, exc)
             finally:
                 q4.task_done()
 
     total = len(live_rows) + len(archive_rows)
-    log.info("Three-source cascade: requests=%s, Playwright=%s, Wayback=%s", workers_l1, workers_l3, workers_l4)
+    active_l1 = workers_l1 if mode != "archive-only" else 0
+    active_l3 = workers_l3 if mode != "archive-only" else 0
+    active_l4 = workers_l4 if mode != "live-only" else 0
+    log.info("Active fetch workers: requests=%s, Playwright=%s, Wayback=%s",
+             active_l1, active_l3, active_l4)
     threads = []
     with tqdm(total=total, desc="Scraping", unit="url") as pbar:
-        for _ in range(workers_l1):
-            threads.append(threading.Thread(target=requests_worker, args=(pbar,), daemon=True))
+        if mode != "archive-only":
+            for _ in range(workers_l1):
+                threads.append(threading.Thread(target=requests_worker, args=(pbar,), daemon=True))
         if mode != "archive-only":
             for _ in range(workers_l3):
                 threads.append(threading.Thread(target=playwright_worker, args=(pbar,), daemon=True))
-        for _ in range(workers_l4):
-            threads.append(threading.Thread(target=wayback_worker, args=(pbar,), daemon=True))
+        if mode != "live-only":
+            for _ in range(workers_l4):
+                threads.append(threading.Thread(target=wayback_worker, args=(pbar,), daemon=True))
         for thread in threads:
             thread.start()
         for row in live_rows:
-            q1.put(new_job(row))
+            enqueue(q1, new_job(row), "requests")
         for row in archive_rows:
             fallback = row if _has_text(row.get("text")) else None
-            q4.put(new_job(row, fallback=fallback))
-        for _ in range(workers_l1): q1.put(None)
-        q1.join()
+            enqueue(q4, new_job(row, fallback=fallback), "Wayback")
         if mode != "archive-only":
-            for _ in range(workers_l3): q3.put(None)
-            q3.join()
-        for _ in range(workers_l4): q4.put(None)
-        q4.join()
+            for _ in range(workers_l1): enqueue(q1, None, "requests")
+            wait_for_stage(q1, "requests")
+        if mode != "archive-only":
+            for _ in range(workers_l3): enqueue(q3, None, "Playwright")
+            wait_for_stage(q3, "Playwright")
+        if mode != "live-only":
+            for _ in range(workers_l4): enqueue(q4, None, "Wayback")
+            wait_for_stage(q4, "Wayback")
+        # Cleanup gets one shared grace period, not ten seconds per thread.
+        cleanup_deadline = time.monotonic() + 10
         for thread in threads:
-            thread.join(timeout=10)
+            thread.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+        still_alive = sum(thread.is_alive() for thread in threads)
+        if still_alive:
+            log.warning("%s daemon worker(s) did not finish cleanup", still_alive)
+        raise_if_fatal()
     with save_lock:
         checkpoint()
     final_path = _merge_outputs(out_dir)
@@ -2094,9 +2245,12 @@ def main():
 
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
-    for name in ("workers_l1", "workers_l3", "workers_l4"):
-        if getattr(args, name) < 1:
-            parser.error(f"--{name.replace('_', '-')} must be at least 1")
+    if any(getattr(args, name) < 0 for name in ("workers_l1", "workers_l3", "workers_l4")):
+        parser.error("worker counts cannot be negative")
+    if args.mode != "archive-only" and (args.workers_l1 < 1 or args.workers_l3 < 1):
+        parser.error("requests and Playwright workers must be at least 1 in live modes")
+    if args.mode != "live-only" and args.workers_l4 < 1:
+        parser.error("Wayback workers must be at least 1 in archive modes")
 
     _FETCH_ONLY = args.fetch_only
 

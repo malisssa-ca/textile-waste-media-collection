@@ -92,9 +92,10 @@ class ScrapePipelineTests(unittest.TestCase):
             def __init__(self, owner):
                 self.owner = owner
 
-            def launch(self, *, headless, channel=None):
+            def launch(self, *, headless, channel=None, timeout=None):
                 self.headless = headless
                 self.channel = channel
+                self.timeout = timeout
                 return FakeBrowser(self.owner)
 
         class FakeInstance:
@@ -120,6 +121,7 @@ class ScrapePipelineTests(unittest.TestCase):
             results.put((first.owner, first is second))
             module._close_pw_browser()
 
+        module._pw_launch_failure = None
         with mock.patch.object(module, "sync_playwright", side_effect=FakeStarter):
             threads = [threading.Thread(target=worker) for _ in range(2)]
             for thread in threads:
@@ -135,12 +137,165 @@ class ScrapePipelineTests(unittest.TestCase):
         self.assertTrue(all(instance.chromium.headless for instance in created))
         expected_channel = "chrome" if sys.platform == "win32" else None
         self.assertTrue(all(instance.chromium.channel == expected_channel for instance in created))
+        self.assertTrue(all(
+            instance.chromium.timeout == module.PLAYWRIGHT_TIMEOUT_S * 1000
+            for instance in created
+        ))
+
+    def test_http_retry_does_not_honor_unbounded_retry_after(self):
+        module._thread_local.sessions = {}
+        session = module._get_session("requests")
+        retry = session.get_adapter("https://").max_retries
+
+        self.assertFalse(retry.respect_retry_after_header)
+        self.assertEqual(retry.total, 1)
+
+    def test_unexpected_worker_failure_aborts_instead_of_waiting_forever(self):
+        row = module.pd.DataFrame([{
+            "id": "broken", "url": "https://example.com/article",
+            "title": "Title", "publish_date": "2020-01-01",
+        }])
+        with (
+            self.subTest("requests worker"),
+            mock.patch.object(
+                module,
+                "_l1_fetch",
+                return_value=module._FetchOutcome(
+                    content=b"<html></html>",
+                    final_url="https://example.com/article",
+                    status_code=200,
+                ),
+            ),
+            mock.patch.object(module, "_build_result", side_effect=RuntimeError("broken extractor")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "requests worker failed"):
+                module.scrape_all(
+                    row, Path("tests"), 1, 1, 0, 10, mode="live-only"
+                )
+
+    def test_live_only_requests_failure_still_reaches_playwright(self):
+        row = module.pd.DataFrame([{
+            "id": "live", "url": "https://example.com/article",
+            "title": "Title", "publish_date": "2020-01-01",
+        }])
+        browser_result = {
+            **row.iloc[0].to_dict(),
+            **module._SCRAPE_DEFAULTS,
+            "scrape_status": "ok",
+            "fetch_method": "playwright",
+            "text": "Recovered article",
+            "text_length": 17,
+            "verification_level": "page_verified",
+        }
+        fake_batch = mock.MagicMock()
+        fake_batch.__len__.return_value = 1
+        fake_readback = mock.MagicMock(height=1)
+        with (
+            mock.patch.object(
+                module, "_l1_fetch",
+                return_value=module._FetchOutcome(error="ConnectTimeout"),
+            ),
+            mock.patch.object(
+                module, "_l3_fetch",
+                return_value=module._FetchOutcome(
+                    content=b"<html></html>", final_url="https://example.com/article",
+                    status_code=200,
+                ),
+            ) as browser_fetch,
+            mock.patch.object(module, "_build_result", return_value=browser_result),
+            mock.patch.object(module, "_close_pw_browser"),
+            mock.patch.object(module.pl, "from_dicts", return_value=fake_batch),
+            mock.patch.object(module.pl, "read_parquet", return_value=fake_readback),
+            mock.patch.object(module.os, "replace"),
+            mock.patch.object(module, "_merge_outputs", return_value=Path("missing.parquet")),
+            mock.patch.object(module, "_atomic_write_text"),
+        ):
+            result = module.scrape_all(
+                row, Path("tests"), 1, 1, 0, 10, mode="live-only"
+            )
+
+        browser_fetch.assert_called_once_with("https://example.com/article")
+        self.assertTrue(result.empty)
+
+    def test_complete_mode_uses_both_conditional_fetch_routes(self):
+        row = module.pd.DataFrame([{
+            "id": "route", "url": "https://example.com/article",
+            "title": "Title", "publish_date": "2020-01-01",
+        }])
+        terminal = {
+            **row.iloc[0].to_dict(),
+            **module._SCRAPE_DEFAULTS,
+            "scrape_status": "ok",
+            "fetch_method": "wayback",
+            "text": "Recovered article",
+            "text_length": 17,
+            "verification_level": "page_verified",
+        }
+
+        for first_outcome, expected_browser_calls in (
+            (module._FetchOutcome(status_code=404, error="http_404"), 0),
+            (module._FetchOutcome(error="ConnectTimeout"), 1),
+        ):
+            fake_batch = mock.MagicMock()
+            fake_batch.__len__.return_value = 1
+            with (
+                self.subTest(first_outcome=first_outcome),
+                mock.patch.object(module, "_l1_fetch", return_value=first_outcome),
+                mock.patch.object(
+                    module, "_l3_fetch",
+                    return_value=module._FetchOutcome(error="TimeoutError"),
+                ) as browser_fetch,
+                mock.patch.object(
+                    module, "_l4_fetch_candidates",
+                    return_value=[module._FetchOutcome(
+                        content=b"<html></html>",
+                        final_url="https://example.com/article",
+                        status_code=200,
+                    )],
+                ) as archive_fetch,
+                mock.patch.object(module, "_build_result", return_value=terminal),
+                mock.patch.object(module, "_close_pw_browser"),
+                mock.patch.object(module.pl, "from_dicts", return_value=fake_batch),
+                mock.patch.object(
+                    module.pl, "read_parquet", return_value=mock.MagicMock(height=1)
+                ),
+                mock.patch.object(module.os, "replace"),
+                mock.patch.object(module, "_merge_outputs", return_value=Path("missing.parquet")),
+                mock.patch.object(module, "_atomic_write_text"),
+            ):
+                result = module.scrape_all(
+                    row, Path("tests"), 1, 1, 1, 10, mode="complete"
+                )
+
+            self.assertEqual(browser_fetch.call_count, expected_browser_calls)
+            archive_fetch.assert_called_once()
+            self.assertTrue(result.empty)
 
     def test_worker_counts_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "workers"):
             module.scrape_all(
                 module.pd.DataFrame(), Path("."), 0, 1, 1, 10
             )
+
+    def test_all_modes_finish_when_there_are_no_pending_rows(self):
+        empty = module.pd.DataFrame(columns=["id", "url", "title", "publish_date"])
+        worker_counts = {
+            "complete": (1, 1, 1),
+            "live-only": (1, 1, 0),
+            "archive-only": (0, 0, 1),
+        }
+        for mode, workers in worker_counts.items():
+            with (
+                self.subTest(mode=mode),
+                mock.patch.object(module, "_atomic_write_text"),
+                mock.patch.object(
+                    module, "_merge_outputs", return_value=Path("missing-test-output.parquet")
+                ),
+            ):
+                result = module.scrape_all(
+                    empty, Path("tests"), *workers, 10, mode=mode
+                )
+            self.assertTrue(result.empty)
 
     def test_wayback_variants_have_approved_order(self):
         self.assertEqual(
@@ -200,6 +355,43 @@ class ScrapePipelineTests(unittest.TestCase):
 
         self.assertEqual(result["traf_categories"], "Kultur")
         self.assertEqual(result["traf_tags"], "news, local")
+
+    def test_source_article_url_keeps_only_explicit_external_read_more_link(self):
+        html = """<html><body>
+        <a href="/latest">More news</a>
+        <a href="https://www.dn.se/article">Läs mer på DN</a>
+        </body></html>"""
+        with mock.patch.object(module, "_extract_l1", return_value={"text": "Recovered text"}):
+            result = module._build_result(
+                {"id": "source", "url": "https://www.pressen.se/123.html"},
+                html, "https://www.pressen.se/123.html", "requests",
+            )
+
+        self.assertEqual(result["source_article_url"], "https://www.dn.se/article")
+
+    def test_source_article_url_keeps_observed_focus_original_link(self):
+        html = """<html><body><p>Das Original zu diesem Beitrag
+        &quot;<a href="https://www.swyrl.tv/article">Original headline</a>&quot;
+        stammt von teleschau.</p></body></html>"""
+        with mock.patch.object(module, "_extract_l1", return_value={"text": "Recovered text"}):
+            result = module._build_result(
+                {"id": "focus", "url": "https://www.focus.de/article"},
+                html, "https://www.focus.de/article", "requests",
+            )
+
+        self.assertEqual(result["source_article_url"], "https://www.swyrl.tv/article")
+
+    def test_source_article_url_rejects_observed_paywall_continue_label(self):
+        html = """<html><body>
+        <a href="https://abo.die-glocke.de/subscribe">Jetzt weiterlesen mit G+</a>
+        </body></html>"""
+        with mock.patch.object(module, "_extract_l1", return_value={"text": "Recovered text"}):
+            result = module._build_result(
+                {"id": "paywall", "url": "https://www.die-glocke.de/article"},
+                html, "https://www.die-glocke.de/article", "requests",
+            )
+
+        self.assertIsNone(result["source_article_url"])
 
     def test_jsonld_acceptance_does_not_run_full_page_trafilatura(self):
         html = '''<html><head><script type="application/ld+json">
