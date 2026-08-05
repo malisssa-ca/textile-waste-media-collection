@@ -16,6 +16,51 @@ SPEC.loader.exec_module(module)
 
 
 class ScrapePipelineTests(unittest.TestCase):
+    def _run_mocked_live_browser_case(self, browser_outcome, browser_result=None):
+        row = module.pd.DataFrame([{
+            "id": "browser-case", "url": "https://example.com/article",
+            "title": "Title", "publish_date": "2020-01-01",
+        }])
+        requests_result = {
+            **row.iloc[0].to_dict(), **module._SCRAPE_DEFAULTS,
+            "scrape_status": "ok", "fetch_method": "requests",
+            "text": "Requests fallback", "text_length": 17,
+            "verification_level": "unverified_text",
+        }
+
+        def build_result(*args, **kwargs):
+            method = args[3]
+            if method == "requests":
+                return dict(requests_result)
+            return dict(browser_result)
+
+        captured = []
+        fake_batch = mock.MagicMock()
+        fake_batch.__len__.return_value = 1
+
+        def capture_rows(rows, **kwargs):
+            captured.extend(dict(item) for item in rows)
+            return fake_batch
+
+        with (
+            mock.patch.object(
+                module, "_l1_fetch",
+                return_value=module._FetchOutcome(
+                    content=b"<html></html>", final_url="https://example.com/article",
+                    status_code=200,
+                ),
+            ),
+            mock.patch.object(module, "_l3_fetch", return_value=browser_outcome),
+            mock.patch.object(module, "_build_result", side_effect=build_result),
+            mock.patch.object(module.pl, "from_dicts", side_effect=capture_rows),
+            mock.patch.object(module.pl, "read_parquet", return_value=mock.MagicMock(height=1)),
+            mock.patch.object(module.os, "replace"),
+            mock.patch.object(module, "_merge_outputs", return_value=Path("missing.parquet")),
+            mock.patch.object(module, "_atomic_write_text"),
+        ):
+            module.scrape_all(row, Path("tests"), 1, 1, 0, 10, mode="live-only")
+        return captured[0]
+
     def test_build_result_has_no_html2txt_fallback(self):
         module._USE_KEYWORD_FILTER = False
         with mock.patch.object(module, "_extract_l1", side_effect=RuntimeError("boom")):
@@ -142,6 +187,216 @@ class ScrapePipelineTests(unittest.TestCase):
             for instance in created
         ))
 
+    def test_playwright_hard_deadline_discards_stalled_process(self):
+        class FakeConnection:
+            def send(self, message):
+                self.message = message
+
+            def poll(self, timeout):
+                return False
+
+        class FakeProcess:
+            def is_alive(self):
+                return True
+
+        supervisor = module._PlaywrightSupervisor()
+        supervisor._connection = FakeConnection()
+        supervisor._process = FakeProcess()
+        with (
+            mock.patch.object(module, "PLAYWRIGHT_HARD_TIMEOUT_S", 0.01),
+            mock.patch.object(supervisor, "_discard") as discard,
+        ):
+            outcome = supervisor.fetch("https://example.com/stalled")
+
+        self.assertEqual(outcome.error, "playwright_hard_timeout")
+        discard.assert_called_once_with(force=True)
+
+    def test_playwright_outcome_distinguishes_browser_results(self):
+        base = {
+            "id": "browser-case", "url": "https://example.com/article",
+            **module._SCRAPE_DEFAULTS, "fetch_method": "playwright",
+        }
+        cases = (
+            (
+                module._FetchOutcome(error="playwright_hard_timeout"),
+                None, "hard_timeout", "Requests fallback",
+            ),
+            (
+                module._FetchOutcome(error="TimeoutError"),
+                None, "fetch_failed", "Requests fallback",
+            ),
+            (
+                module._FetchOutcome(
+                    content=b"<html></html>", final_url="https://example.com/article",
+                    status_code=200,
+                ),
+                {**base, "scrape_status": "extract_error", "verification_level": "no_text"},
+                "no_text", "Requests fallback",
+            ),
+            (
+                module._FetchOutcome(
+                    content=b"<html></html>", final_url="https://example.com/article",
+                    status_code=200,
+                ),
+                {
+                    **base, "scrape_status": "ok", "text": "Browser text",
+                    "text_length": 12, "verification_level": "unverified_text",
+                },
+                "unverified_text", "Requests fallback",
+            ),
+            (
+                module._FetchOutcome(
+                    content=b"<html></html>", final_url="https://example.com/article",
+                    status_code=200,
+                ),
+                {
+                    **base, "scrape_status": "ok", "text": "Accepted browser text",
+                    "text_length": 21, "verification_level": "page_verified",
+                },
+                "accepted", "Accepted browser text",
+            ),
+        )
+        for browser_fetch, browser_result, expected_outcome, expected_text in cases:
+            with self.subTest(playwright_outcome=expected_outcome):
+                result = self._run_mocked_live_browser_case(browser_fetch, browser_result)
+                self.assertEqual(result["playwright_outcome"], expected_outcome)
+                self.assertEqual(result["text"], expected_text)
+                self.assertEqual(result["needs_archive"], expected_outcome != "accepted")
+
+    def test_verified_result_preserves_longest_unverified_from_any_fetch_layer(self):
+        row = module.pd.DataFrame([{
+            "id": "fallback-case", "url": "https://example.com/article",
+            "title": "Title", "publish_date": "2020-01-01",
+        }])
+        cases = (
+            ({"requests": 500, "playwright": 300, "wayback": 200}, "requests"),
+            ({"requests": 300, "playwright": 500, "wayback": 200}, "playwright"),
+            ({"requests": 300, "playwright": 200, "wayback": 500}, "wayback"),
+        )
+        for lengths, expected_method in cases:
+            with self.subTest(expected_method=expected_method):
+                wayback_builds = 0
+
+                def build_result(*args, **kwargs):
+                    nonlocal wayback_builds
+                    method = args[3]
+                    if method == "wayback":
+                        wayback_builds += 1
+                    verified = method == "wayback" and wayback_builds == 2
+                    text = "V" * 50 if verified else method[0].upper() * lengths[method]
+                    return {
+                        **row.iloc[0].to_dict(), **module._SCRAPE_DEFAULTS,
+                        "scrape_status": "ok", "fetch_method": method,
+                        "text": text, "text_length": len(text),
+                        "target_verified": verified,
+                        "verification_level": "strict_verified" if verified else "unverified_text",
+                    }
+
+                captured = []
+                fake_batch = mock.MagicMock()
+                fake_batch.__len__.return_value = 1
+
+                def capture_rows(rows, **kwargs):
+                    captured.extend(dict(item) for item in rows)
+                    return fake_batch
+
+                with (
+                    mock.patch.object(
+                        module, "_l1_fetch",
+                        return_value=module._FetchOutcome(
+                            content=b"requests", final_url="https://example.com/article",
+                            status_code=200,
+                        ),
+                    ),
+                    mock.patch.object(
+                        module, "_l3_fetch",
+                        return_value=module._FetchOutcome(
+                            content=b"playwright", final_url="https://example.com/article",
+                            status_code=200,
+                        ),
+                    ),
+                    mock.patch.object(
+                        module, "_l4_fetch_candidates",
+                        return_value=[
+                            module._FetchOutcome(
+                                content=b"archive-one", final_url="https://example.com/article",
+                                status_code=200,
+                            ),
+                            module._FetchOutcome(
+                                content=b"archive-two", final_url="https://example.com/article",
+                                status_code=200,
+                            ),
+                        ],
+                    ),
+                    mock.patch.object(module, "_build_result", side_effect=build_result),
+                    mock.patch.object(module.pl, "from_dicts", side_effect=capture_rows),
+                    mock.patch.object(
+                        module.pl, "read_parquet", return_value=mock.MagicMock(height=1)
+                    ),
+                    mock.patch.object(module.os, "replace"),
+                    mock.patch.object(
+                        module, "_merge_outputs", return_value=Path("missing.parquet")
+                    ),
+                    mock.patch.object(module, "_atomic_write_text"),
+                ):
+                    module.scrape_all(row, Path("tests"), 1, 1, 1, 10, mode="complete")
+
+                result = captured[0]
+                self.assertEqual(result["text"], "V" * 50)
+                self.assertEqual(result["fallback_fetch_method"], expected_method)
+                self.assertEqual(result["fallback_text_length"], lengths[expected_method])
+                self.assertEqual(
+                    result["fallback_text"],
+                    expected_method[0].upper() * lengths[expected_method],
+                )
+
+    def test_longest_unverified_is_primary_when_nothing_is_verified(self):
+        browser_text = "Longer browser candidate " * 10
+        browser_result = {
+            "id": "browser-case", "url": "https://example.com/article",
+            **module._SCRAPE_DEFAULTS, "scrape_status": "ok",
+            "fetch_method": "playwright", "text": browser_text,
+            "text_length": len(browser_text), "verification_level": "unverified_text",
+        }
+        result = self._run_mocked_live_browser_case(
+            module._FetchOutcome(
+                content=b"<html></html>", final_url="https://example.com/article",
+                status_code=200,
+            ),
+            browser_result,
+        )
+
+        self.assertEqual(result["text"], browser_text)
+        self.assertEqual(result["fetch_method"], "playwright")
+        self.assertIsNone(result["fallback_text"])
+        self.assertIsNone(result["fallback_fetch_method"])
+        self.assertIsNone(result["fallback_text_length"])
+
+    def test_verified_extraction_preserves_longer_unverified_extractor_text(self):
+        long_unverified = "L" * 500
+        short_verified = "S" * 50
+        with (
+            mock.patch.object(
+                module,
+                "_jsonld_article_candidates",
+                return_value=[{"text": long_unverified, "urls": [], "headline": None}],
+            ),
+            mock.patch.object(module, "_extract_itemprop_bodies", return_value=[short_verified]),
+            mock.patch.object(module, "_identity_sources", side_effect=[[], ["canonical"]]),
+        ):
+            result = module._build_result(
+                {"id": "extract-fallback", "url": "https://example.com/article"},
+                "<html><body></body></html>",
+                "https://example.com/article",
+                "requests",
+            )
+
+        self.assertEqual(result["text"], short_verified)
+        self.assertEqual(result["verification_level"], "strict_verified")
+        self.assertEqual(result["fallback_text"], long_unverified)
+        self.assertEqual(result["fallback_fetch_method"], "requests")
+        self.assertEqual(result["fallback_text_length"], len(long_unverified))
+
     def test_http_retry_does_not_honor_unbounded_retry_after(self):
         module._thread_local.sessions = {}
         session = module._get_session("requests")
@@ -232,9 +487,9 @@ class ScrapePipelineTests(unittest.TestCase):
             "verification_level": "page_verified",
         }
 
-        for first_outcome, expected_browser_calls in (
-            (module._FetchOutcome(status_code=404, error="http_404"), 0),
-            (module._FetchOutcome(error="ConnectTimeout"), 1),
+        for first_outcome, expected_browser_calls, expected_browser_outcome in (
+            (module._FetchOutcome(status_code=404, error="http_404"), 0, None),
+            (module._FetchOutcome(error="ConnectTimeout"), 1, "hard_timeout"),
         ):
             fake_batch = mock.MagicMock()
             fake_batch.__len__.return_value = 1
@@ -243,7 +498,7 @@ class ScrapePipelineTests(unittest.TestCase):
                 mock.patch.object(module, "_l1_fetch", return_value=first_outcome),
                 mock.patch.object(
                     module, "_l3_fetch",
-                    return_value=module._FetchOutcome(error="TimeoutError"),
+                    return_value=module._FetchOutcome(error="playwright_hard_timeout"),
                 ) as browser_fetch,
                 mock.patch.object(
                     module, "_l4_fetch_candidates",
@@ -269,6 +524,7 @@ class ScrapePipelineTests(unittest.TestCase):
 
             self.assertEqual(browser_fetch.call_count, expected_browser_calls)
             archive_fetch.assert_called_once()
+            self.assertEqual(terminal["playwright_outcome"], expected_browser_outcome)
             self.assertTrue(result.empty)
 
     def test_worker_counts_must_be_positive(self):

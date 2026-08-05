@@ -17,8 +17,12 @@ All modes reuse the same output folder and checkpoints, so restarting does not
 repeat completed work. For each page found, the script tries several article
 text extractors and records how confidently the text matches the requested
 article: ``strict_verified``, ``page_verified``, ``unverified_text``, or
-``no_text``. Full article results are saved to Parquet; small JSON files record
-run state, metrics, and failed URLs.
+``no_text``. The nullable ``playwright_outcome`` column says whether Chromium
+accepted text, returned unverified/no text, failed, or hit its hard timeout.
+When a shorter verified candidate wins, the ``fallback_*`` columns preserve
+the longest unverified text and its fetch source for later comparison.
+Full article results are saved to Parquet; small JSON files record run state,
+metrics, and failed URLs.
 
 Run: ``python textile_waste_p2_scrape.py --mode complete``
 Use ``--help`` to see input/output and worker options.
@@ -31,9 +35,12 @@ import ctypes
 import html as html_lib
 import json
 import logging
+import multiprocessing
 import os
 import queue
 import re
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -72,7 +79,7 @@ except ImportError:
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
-PIPELINE_VERSION = "2026-08-04-v6-three-source"
+PIPELINE_VERSION = "2026-08-05-v7-supervised-playwright"
 _RUN_ID = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
 
 def _system_resources() -> tuple[int, float, float]:
@@ -130,6 +137,7 @@ CHECKPOINT_MAX_AGE_S = 300
 REQUEST_CONNECT_TIMEOUT_S = 3
 REQUEST_READ_TIMEOUT_S = 7
 PLAYWRIGHT_TIMEOUT_S = 15
+PLAYWRIGHT_HARD_TIMEOUT_S = 45
 WAYBACK_CDX_READ_TIMEOUT_S = 10
 WAYBACK_SNAPSHOT_READ_TIMEOUT_S = 15
 LIVE_DOMAIN_MIN_GAP_S = 0.5
@@ -213,6 +221,8 @@ class _ScrapeJob(TypedDict):
     fallback: dict[str, Any] | None
     had_fetch: bool
     last_outcome: _FetchOutcome | None
+    playwright_outcome: str | None
+    longest_unverified: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -378,11 +388,12 @@ def _l1_fetch(url: str) -> _FetchOutcome:
     return outcome
 
 
-# Playwright is not thread-safe. Each L3 worker therefore owns one lazily
-# started Playwright instance and browser for the lifetime of that thread.
-# The domain lock is released before page.goto() so a slow browser render
-# does not block other threads from hitting the same domain.
+# Playwright is not thread-safe. Each L3 worker supervises one persistent child
+# process, and that child owns one browser. A fresh browser context still
+# isolates every URL, while the parent can kill and replace the complete
+# Python/Node/Chromium process group if Playwright itself stops responding.
 _pw_thread_local = threading.local()
+_pw_supervisor_local = threading.local()
 _pw_launch_lock = threading.Lock()
 _pw_launch_failure: str | None = None
 
@@ -470,16 +481,18 @@ def _close_pw_browser() -> None:
             del _pw_thread_local.instance
 
 
-def _l3_fetch(url: str) -> _FetchOutcome:
-    """Layer 3 — headless Chromium. Rate limit enforced before fetch (lock not held during render)."""
-    _enforce_rate_limit(urlparse(url).netloc)
-    if not PLAYWRIGHT_AVAILABLE:
-        return _FetchOutcome(error="dependency_unavailable", source_url=url)
+def _l3_fetch_direct(url: str, report_phase=None) -> _FetchOutcome:
+    """Run one browser fetch inside the killable Playwright child process."""
+    def phase(value: str) -> None:
+        if report_phase is not None:
+            report_phase(value)
+
     context = None
-    log.debug("Playwright start: %s", url)
     try:
+        phase("context")
         context = _new_pw_context()
         page = context.new_page()
+        phase("navigation")
         resp = page.goto(url, timeout=PLAYWRIGHT_TIMEOUT_S * 1000, wait_until="domcontentloaded")
         if not resp:
             return _FetchOutcome(error="no_navigation_response", source_url=url)
@@ -493,6 +506,7 @@ def _l3_fetch(url: str) -> _FetchOutcome:
 
         # Handle common consent-management platforms without attempting to
         # defeat authentication, subscriptions, CAPTCHAs, or access controls.
+        phase("consent")
         consent_selectors = (
             "#onetrust-accept-btn-handler",
             "#didomi-notice-agree-button",
@@ -535,6 +549,7 @@ def _l3_fetch(url: str) -> _FetchOutcome:
         # page.content() has no timeout parameter. Capture the identical document
         # through a locator operation so a stalled renderer is bounded by the
         # configured Playwright timeout instead of occupying a worker forever.
+        phase("capture")
         content = page.locator("html").evaluate(
             "node => '<!doctype html>\\n' + node.outerHTML",
             timeout=PLAYWRIGHT_TIMEOUT_S * 1000,
@@ -550,12 +565,192 @@ def _l3_fetch(url: str) -> _FetchOutcome:
         log.debug(f"playwright failed on {url}: {exc!r}")
         return _FetchOutcome(error=_error_name(exc), source_url=url)
     finally:
+        phase("cleanup")
         if context is not None:
             try:
                 context.close()
             except Exception as exc:
                 log.debug(f"playwright context cleanup failed for {url}: {exc!r}")
-        log.debug("Playwright finish: %s", url)
+
+
+def _playwright_child_main(connection) -> None:
+    """Own Playwright in an isolated process and serve fetch requests."""
+    if os.name == "posix":
+        try:
+            os.setsid()
+        except OSError:
+            pass
+    try:
+        while True:
+            message = connection.recv()
+            if message is None:
+                return
+            request_id, url = message
+
+            def report_phase(value: str) -> None:
+                connection.send(("phase", request_id, value))
+
+            outcome = _l3_fetch_direct(url, report_phase)
+            payload = {
+                name: getattr(outcome, name)
+                for name in _FetchOutcome.__dataclass_fields__
+            }
+            connection.send(("result", request_id, payload))
+    except (EOFError, BrokenPipeError, OSError):
+        return
+    finally:
+        _close_pw_browser()
+        try:
+            connection.close()
+        except OSError:
+            pass
+
+
+class _PlaywrightSupervisor:
+    """Keep one browser child alive, but enforce a true per-URL deadline."""
+
+    def __init__(self) -> None:
+        self._context = multiprocessing.get_context("spawn")
+        self._connection = None
+        self._process = None
+        self._request_id = 0
+
+    def _start(self) -> None:
+        parent, child = self._context.Pipe(duplex=True)
+        process = self._context.Process(
+            target=_playwright_child_main,
+            args=(child,),
+            daemon=True,
+        )
+        process.start()
+        child.close()
+        self._connection = parent
+        self._process = process
+
+    def _discard(self, *, force: bool) -> None:
+        connection, process = self._connection, self._process
+        self._connection = None
+        self._process = None
+        if connection is not None:
+            if not force:
+                try:
+                    connection.send(None)
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+            try:
+                connection.close()
+            except OSError:
+                pass
+        if process is None:
+            return
+        if not force:
+            process.join(timeout=2)
+        if process.is_alive():
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except OSError:
+                    process.terminate()
+                process.join(timeout=2)
+                if process.is_alive():
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except OSError:
+                        process.kill()
+            else:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                        check=False,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    process.kill()
+            process.join(timeout=2)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2)
+        try:
+            process.close()
+        except (OSError, ValueError):
+            pass
+
+    def fetch(self, url: str) -> _FetchOutcome:
+        if self._process is None or not self._process.is_alive():
+            self._discard(force=True)
+            try:
+                self._start()
+            except Exception as exc:
+                return _FetchOutcome(error=_error_name(exc), source_url=url)
+
+        self._request_id += 1
+        request_id = self._request_id
+        last_phase = "startup"
+        log.debug("Playwright start: %s", url)
+        try:
+            self._connection.send((request_id, url))
+        except (BrokenPipeError, EOFError, OSError) as exc:
+            self._discard(force=True)
+            log.debug("Playwright finish: %s (process_send_failed)", url)
+            return _FetchOutcome(error=_error_name(exc), source_url=url)
+
+        deadline = time.monotonic() + PLAYWRIGHT_HARD_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if not self._process.is_alive():
+                self._discard(force=True)
+                log.debug("Playwright finish: %s (process_exit, phase=%s)", url, last_phase)
+                return _FetchOutcome(error="playwright_process_exit", source_url=url)
+            remaining = deadline - time.monotonic()
+            try:
+                if not self._connection.poll(min(0.5, max(0.0, remaining))):
+                    continue
+                kind, received_id, payload = self._connection.recv()
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                self._discard(force=True)
+                log.debug("Playwright finish: %s (process_receive_failed)", url)
+                return _FetchOutcome(error=_error_name(exc), source_url=url)
+            if received_id != request_id:
+                continue
+            if kind == "phase":
+                last_phase = str(payload)
+                log.debug("Playwright phase=%s: %s", last_phase, url)
+                continue
+            if kind == "result":
+                outcome = _FetchOutcome(**payload)
+                log.debug("Playwright finish: %s (%s)", url, outcome.error or "fetched")
+                return outcome
+
+        log.warning(
+            "Playwright hard timeout after %ss at phase=%s: %s; restarting browser process",
+            PLAYWRIGHT_HARD_TIMEOUT_S,
+            last_phase,
+            url,
+        )
+        self._discard(force=True)
+        log.debug("Playwright finish: %s (hard_timeout)", url)
+        return _FetchOutcome(error="playwright_hard_timeout", source_url=url)
+
+    def close(self) -> None:
+        self._discard(force=False)
+
+
+def _l3_fetch(url: str) -> _FetchOutcome:
+    """Layer 3 — supervised headless Chromium with a hard wall-clock limit."""
+    _enforce_rate_limit(urlparse(url).netloc)
+    if not PLAYWRIGHT_AVAILABLE:
+        return _FetchOutcome(error="dependency_unavailable", source_url=url)
+    if not hasattr(_pw_supervisor_local, "supervisor"):
+        _pw_supervisor_local.supervisor = _PlaywrightSupervisor()
+    return _pw_supervisor_local.supervisor.fetch(url)
+
+
+def _close_pw_supervisor() -> None:
+    supervisor = getattr(_pw_supervisor_local, "supervisor", None)
+    if supervisor is not None:
+        supervisor.close()
+        del _pw_supervisor_local.supervisor
 
 
 def _publication_timestamp(value) -> str | None:
@@ -1158,6 +1353,31 @@ def _has_text(value) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _is_unverified_result(result: Mapping[str, Any] | None) -> bool:
+    """Recognize current and legacy rows containing unverified text."""
+    if not result or not _has_text(result.get("text")):
+        return False
+    level = result.get("verification_level")
+    if level is not None:
+        return level == "unverified_text"
+    return not bool(result.get("target_verified"))
+
+
+def _attach_longer_unverified(result: dict, alternative: Mapping[str, Any] | None) -> None:
+    """Preserve a longer unverified candidate without replacing verified text."""
+    if not _is_unverified_result(alternative):
+        return
+    alternative_text = str(alternative["text"])
+    alternative_length = len(alternative_text)
+    primary_length = len(str(result.get("text") or ""))
+    saved_length = int(result.get("fallback_text_length") or 0)
+    if alternative_length <= primary_length or alternative_length <= saved_length:
+        return
+    result["fallback_text"] = alternative_text
+    result["fallback_fetch_method"] = alternative.get("fetch_method")
+    result["fallback_text_length"] = alternative_length
+
+
 def _needs_archive_attempt(row: Mapping[str, Any]) -> bool:
     """Return whether a row remains in the Archive-only work queue.
 
@@ -1203,6 +1423,9 @@ _SCRAPE_DEFAULTS: dict = {
     "http_status": None, "fetch_error": None, "capture_time": None,
     "target_verified": False, "verified_by": None,
     "verification_level": "no_text", "needs_archive": False,
+    "playwright_outcome": None,
+    "fallback_text": None, "fallback_fetch_method": None,
+    "fallback_text_length": None,
     "canonical_url": None, "source_article_url": None,
     "structured_url": None, "structured_title": None,
     "fundus_publisher": None, "fundus_free_access": None,
@@ -1355,11 +1578,19 @@ def _build_result(
             "structured_title": structured_title,
             **(extra or {}),
         }
-        if _rank(candidate) > _rank(provisional):
-            provisional = candidate
         if level in {"strict_verified", "page_verified"}:
+            _attach_longer_unverified(candidate, provisional)
             _metric("extract", method_name, terminal=True, attempt=False)
             return candidate
+        if (
+            _rank(candidate) > _rank(provisional)
+            or (
+                _rank(candidate) == _rank(provisional)
+                and len(str(candidate.get("text") or ""))
+                > len(str((provisional or {}).get("text") or ""))
+            )
+        ):
+            provisional = candidate
         return None
 
     # 1. schema.org JSON-LD articleBody.
@@ -1781,6 +2012,12 @@ def scrape_all(
     fatal_event = threading.Event()
     fatal_lock = threading.Lock()
     fatal_errors: list[tuple[str, str, BaseException]] = []
+    stage_progress_lock = threading.Lock()
+    stage_progress = {
+        "requests": time.monotonic(),
+        "Playwright": time.monotonic(),
+        "Wayback": time.monotonic(),
+    }
     checkpoint_index = max((int(p.stem.rsplit("_", 1)[1]) for p in checkpoint_files
                             if p.stem.rsplit("_", 1)[1].isdigit()), default=-1) + 1
 
@@ -1806,21 +2043,25 @@ def scrape_all(
         detail = f" while processing {url}" if url else ""
         raise RuntimeError(f"{stage} worker failed{detail}: {_error_name(exc)}") from exc
 
+    def mark_stage_progress(stage: str) -> None:
+        with stage_progress_lock:
+            stage_progress[stage] = time.monotonic()
+
     def enqueue(target: queue.Queue, item, stage: str) -> None:
-        """Bound queue backpressure so a stalled downstream stage is visible."""
-        deadline = time.monotonic() + CHECKPOINT_MAX_AGE_S
+        """Apply backpressure, failing only when the whole stage stops dequeuing."""
         while True:
             raise_if_fatal()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError(
-                    f"{stage} queue accepted no work for {CHECKPOINT_MAX_AGE_S}s"
-                )
             try:
-                target.put(item, timeout=min(1.0, remaining))
+                target.put(item, timeout=1.0)
                 return
             except queue.Full:
-                continue
+                with stage_progress_lock:
+                    idle_for = time.monotonic() - stage_progress[stage]
+                if idle_for >= CHECKPOINT_MAX_AGE_S:
+                    raise RuntimeError(
+                        f"{stage} queue made no dequeue progress for "
+                        f"{CHECKPOINT_MAX_AGE_S}s"
+                    )
 
     def wait_for_stage(target: queue.Queue, stage: str) -> None:
         """Wait for progress, but never wait forever on dead or stalled workers."""
@@ -1872,9 +2113,26 @@ def scrape_all(
                 "strict_verified": 3}.get((result or {}).get("verification_level"), 0)
 
     def new_job(row: dict, fallback: dict | None = None) -> _ScrapeJob:
+        longest_unverified = fallback if _is_unverified_result(fallback) else None
+        if fallback is not None and _has_text(fallback.get("fallback_text")):
+            saved_alternative = {
+                "scrape_status": "ok",
+                "verification_level": "unverified_text",
+                "target_verified": False,
+                "text": fallback["fallback_text"],
+                "text_length": fallback.get("fallback_text_length"),
+                "fetch_method": fallback.get("fallback_fetch_method"),
+            }
+            if (
+                longest_unverified is None
+                or len(str(saved_alternative["text"]))
+                > len(str(longest_unverified.get("text") or ""))
+            ):
+                longest_unverified = saved_alternative
         return {"row": {**row, "id": str(row.get("id", ""))}, "attempts": [], "trace": [],
                 "archive_urls": [row.get("url")], "fallback": fallback, "had_fetch": False,
-                "last_outcome": None}
+                "last_outcome": None, "playwright_outcome": row.get("playwright_outcome"),
+                "longest_unverified": longest_unverified}
 
     def trace(job: _ScrapeJob, method: str, outcome: _FetchOutcome) -> None:
         job["trace"].append({key: value for key, value in {
@@ -1889,12 +2147,37 @@ def scrape_all(
                                   http_status=outcome.status_code, fetch_error=outcome.error,
                                   capture_time=outcome.capture_time)
         terminal = _is_terminal_result(candidate)
+        if _is_unverified_result(candidate) and (
+            job["longest_unverified"] is None
+            or len(str(candidate.get("text") or ""))
+            > len(str(job["longest_unverified"].get("text") or ""))
+        ):
+            job["longest_unverified"] = candidate
+        if method == "playwright":
+            if terminal:
+                job["playwright_outcome"] = "accepted"
+            elif candidate.get("scrape_status") == "ok" and _has_text(candidate.get("text")):
+                job["playwright_outcome"] = "unverified_text"
+            else:
+                job["playwright_outcome"] = "no_text"
+        candidate["playwright_outcome"] = job["playwright_outcome"]
         candidate["attempted_methods"] = ",".join(job["attempts"])
         candidate["attempt_trace"] = json.dumps(job["trace"], ensure_ascii=False, separators=(",", ":"))
         if terminal:
+            _attach_longer_unverified(candidate, job["longest_unverified"])
             return candidate
-        if candidate.get("scrape_status") == "ok" and rank(candidate) > rank(job["fallback"]):
-            job["fallback"] = candidate
+        if candidate.get("scrape_status") == "ok":
+            candidate_rank = rank(candidate)
+            fallback_rank = rank(job["fallback"])
+            if (
+                candidate_rank > fallback_rank
+                or (
+                    candidate_rank == fallback_rank == 1
+                    and len(str(candidate.get("text") or ""))
+                    > len(str((job["fallback"] or {}).get("text") or ""))
+                )
+            ):
+                job["fallback"] = candidate
         return None
 
     def finalize(job: _ScrapeJob, *, needs_archive: bool) -> dict:
@@ -1907,6 +2190,7 @@ def scrape_all(
                       "text_length": 0, "http_status": last.status_code if last else None,
                       "fetch_error": last.error if last else None}
         result["needs_archive"] = needs_archive
+        result["playwright_outcome"] = job["playwright_outcome"]
         result["attempted_methods"] = ",".join(job["attempts"])
         result["attempt_trace"] = json.dumps(job["trace"], ensure_ascii=False, separators=(",", ":"))
         result["completed_at"] = datetime.now(timezone.utc).isoformat()
@@ -1928,6 +2212,7 @@ def scrape_all(
     def requests_worker(pbar) -> None:
         while True:
             job = q1.get()
+            mark_stage_progress("requests")
             try:
                 if job is None:
                     return
@@ -1957,6 +2242,7 @@ def scrape_all(
         try:
             while True:
                 job = q3.get()
+                mark_stage_progress("Playwright")
                 try:
                     if job is None:
                         return
@@ -1972,20 +2258,27 @@ def scrape_all(
                             save(finalize(job, needs_archive=True), pbar)
                         else:
                             enqueue(q4, job, "Wayback")
-                    elif mode == "live-only":
-                        save(finalize(job, needs_archive=True), pbar)
                     else:
-                        enqueue(q4, job, "Wayback")
+                        job["playwright_outcome"] = (
+                            "hard_timeout"
+                            if outcome.error == "playwright_hard_timeout"
+                            else "fetch_failed"
+                        )
+                        if mode == "live-only":
+                            save(finalize(job, needs_archive=True), pbar)
+                        else:
+                            enqueue(q4, job, "Wayback")
                 except BaseException as exc:
                     record_fatal("Playwright", job, exc)
                 finally:
                     q3.task_done()
         finally:
-            _close_pw_browser()
+            _close_pw_supervisor()
 
     def wayback_worker(pbar) -> None:
         while True:
             job = q4.get()
+            mark_stage_progress("Wayback")
             try:
                 if job is None:
                     return
