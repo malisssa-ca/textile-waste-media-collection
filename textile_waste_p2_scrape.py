@@ -130,7 +130,7 @@ _CPU_COUNT, _RAM_TOTAL_GIB, _RAM_AVAILABLE_GIB = _system_resources()
 # for browser workers; the submission script can still select an explicit value.
 WORKERS_L1 = min(32, max(8, round(_CPU_COUNT * 2.25)))
 WORKERS_L3 = max(1, _CPU_COUNT // 2) if _RAM_AVAILABLE_GIB >= 8 else 1
-WORKERS_L4 = 4 if _CPU_COUNT >= 8 else 2
+WORKERS_L4 = min(12, max(4, _CPU_COUNT // 2)) if _CPU_COUNT >= 8 else 2
 
 SCRAPE_SAVE_EVERY = 1000
 CHECKPOINT_MAX_AGE_S = 300
@@ -141,7 +141,10 @@ PLAYWRIGHT_HARD_TIMEOUT_S = 45
 WAYBACK_CDX_READ_TIMEOUT_S = 10
 WAYBACK_SNAPSHOT_READ_TIMEOUT_S = 15
 LIVE_DOMAIN_MIN_GAP_S = 0.5
-WAYBACK_MIN_GAP_S = 2.5
+# One globally paced request per second is deliberately modest for the public
+# archive, while twelve I/O workers keep that pace filled when individual CDX
+# or snapshot responses are slow.
+WAYBACK_MIN_GAP_S = 1.0
 WAYBACK_MAX_SNAPSHOTS = 2
 WAYBACK_BREAKER_FAILURES = 5
 WAYBACK_BREAKER_PAUSE_S = 60
@@ -858,11 +861,20 @@ def _query_wayback_cdx(url: str, target: str | None) -> list[_ArchiveCapture]:
 
 
 def _wayback_snapshot_refs(urls, publish_date=None) -> list[_ArchiveCapture]:
-    """Return unique snapshots closest to the MediaCloud publication date."""
+    """Return up to two captures from the first URL form that has any.
+
+    The approved URL forms are fallbacks, not three unconditional CDX lookups:
+    exact normalized URL, HTTP for HTTPS, then query-free.  This retains
+    alternate forms when needed without spending two extra index requests for
+    the usual exact-URL capture.
+    """
     target = _publication_timestamp(publish_date)
-    captures: list[_ArchiveCapture] = []
     for variant in _archive_url_variants(urls):
-        captures.extend(_query_wayback_cdx(variant, target))
+        captures = _query_wayback_cdx(variant, target)
+        if captures:
+            break
+    else:
+        return []
     captures.sort(key=lambda item: _timestamp_distance(item.timestamp, target))
     selected: list[_ArchiveCapture] = []
     seen_digests: set[str] = set()

@@ -570,6 +570,29 @@ class ScrapePipelineTests(unittest.TestCase):
 
         self.assertEqual([capture.fetch_url for capture in selected], ["one", "two"])
 
+    def test_wayback_stops_url_lookup_after_exact_capture(self):
+        capture = module._ArchiveCapture("20200101000000", "https://example.com/a", "exact")
+        with mock.patch.object(module, "_query_wayback_cdx", return_value=[capture]) as lookup:
+            selected = module._wayback_snapshot_refs(
+                ["https://example.com/a?utm=x"], "2020-01-15"
+            )
+
+        self.assertEqual([item.fetch_url for item in selected], ["exact"])
+        lookup.assert_called_once_with("https://example.com/a?utm=x", "20200115000000")
+
+    def test_wayback_uses_url_forms_only_after_prior_form_has_no_capture(self):
+        http_capture = module._ArchiveCapture("20200101000000", "http://example.com/a", "http")
+        with mock.patch.object(module, "_query_wayback_cdx", side_effect=[[], [http_capture]]) as lookup:
+            selected = module._wayback_snapshot_refs(
+                ["https://example.com/a?utm=x"], "2020-01-15"
+            )
+
+        self.assertEqual([item.fetch_url for item in selected], ["http"])
+        self.assertEqual(
+            [call.args[0] for call in lookup.call_args_list],
+            ["https://example.com/a?utm=x", "http://example.com/a?utm=x"],
+        )
+
     def test_page_verified_is_terminal_without_strict_boolean(self):
         result = {"scrape_status": "ok", "target_verified": False,
                   "verification_level": "page_verified", "text": "article"}

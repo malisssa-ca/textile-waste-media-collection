@@ -33,4 +33,4 @@ python -X faulthandler -u textile_waste_p2_scrape.py \
   --mode live-only \
   --workers-l1 24 \
   --workers-l3 12 \
-  --workers-l4 5
+  --workers-l4 12
