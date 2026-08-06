@@ -27,7 +27,7 @@ OUTPUT_DIR="$HOME/textile_waste_outputs"
 mkdir -p "$OUTPUT_DIR"
 
 # Change only --mode below; inactive worker groups are not started.
-python -u textile_waste_p2_scrape.py \
+python -X faulthandler -u textile_waste_p2_scrape.py \
   --input-dir "$INPUT_DIR" \
   --output-dir "$OUTPUT_DIR" \
   --mode live-only \
