@@ -1931,6 +1931,25 @@ def _wayback_allowed() -> bool:
         return time.monotonic() >= _wayback_open_until
 
 
+def _wait_for_wayback(cancel_event: threading.Event | None = None) -> bool:
+    """Wait for an open Wayback circuit breaker instead of skipping queued URLs.
+
+    ``True`` means the caller may make its Wayback request.  ``False`` means
+    shutdown was requested while waiting.  The wait is shared through the
+    breaker timestamp, so all workers resume together after the single
+    provider-protection pause.
+    """
+    while True:
+        with _wayback_breaker_lock:
+            remaining = _wayback_open_until - time.monotonic()
+        if remaining <= 0:
+            return True
+        if cancel_event is None:
+            time.sleep(remaining)
+        elif cancel_event.wait(timeout=remaining):
+            return False
+
+
 def _record_wayback_health(outcome: _FetchOutcome) -> bool:
     """Update the small provider circuit breaker and return provider failure."""
     global _wayback_consecutive_failures, _wayback_open_until
@@ -1942,7 +1961,11 @@ def _record_wayback_health(outcome: _FetchOutcome) -> bool:
             if _wayback_consecutive_failures >= WAYBACK_BREAKER_FAILURES:
                 _wayback_open_until = time.monotonic() + WAYBACK_BREAKER_PAUSE_S
                 _wayback_consecutive_failures = 0
-                log.warning("Wayback circuit breaker open for %ss", WAYBACK_BREAKER_PAUSE_S)
+                log.warning(
+                    "Wayback circuit breaker pausing queued work for %ss; "
+                    "workers will resume afterward",
+                    WAYBACK_BREAKER_PAUSE_S,
+                )
         elif outcome.content is not None:
             _wayback_consecutive_failures = 0
         return provider_failure
@@ -2284,9 +2307,7 @@ def scrape_all(
                     return
                 if fatal_event.is_set():
                     continue
-                if not _wayback_allowed():
-                    trace(job, "wayback", _FetchOutcome(error="circuit_open"))
-                    save(finalize(job, needs_archive=True), pbar)
+                if not _wait_for_wayback(fatal_event):
                     continue
                 job["attempts"].append("wayback")
                 accepted = None

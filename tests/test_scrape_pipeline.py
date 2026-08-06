@@ -596,6 +596,28 @@ class ScrapePipelineTests(unittest.TestCase):
         self.assertFalse(module._wayback_allowed())
         module._wayback_open_until = 0.0
 
+    def test_wayback_breaker_waits_instead_of_skipping_queued_work(self):
+        module._wayback_open_until = 160.0
+        try:
+            with (
+                mock.patch.object(module.time, "monotonic", side_effect=[100.0, 160.0]),
+                mock.patch.object(module.time, "sleep") as sleep,
+            ):
+                self.assertTrue(module._wait_for_wayback())
+            sleep.assert_called_once_with(60.0)
+        finally:
+            module._wayback_open_until = 0.0
+
+    def test_wayback_breaker_wait_honors_clean_shutdown(self):
+        stop = threading.Event()
+        stop.set()
+        module._wayback_open_until = 160.0
+        try:
+            with mock.patch.object(module.time, "monotonic", return_value=100.0):
+                self.assertFalse(module._wait_for_wayback(stop))
+        finally:
+            module._wayback_open_until = 0.0
+
     def test_wayback_cdx_failure_reaches_circuit_breaker(self):
         with mock.patch.object(
             module, "_wayback_snapshot_refs", side_effect=module.requests.ConnectionError("down")
