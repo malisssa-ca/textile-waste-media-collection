@@ -614,13 +614,23 @@ class ScrapePipelineTests(unittest.TestCase):
     def test_wayback_circuit_breaker_opens_after_five_provider_errors(self):
         module._wayback_consecutive_failures = 0
         module._wayback_open_until = 0.0
-        for _ in range(5):
-            module._record_wayback_health(module._FetchOutcome(error="ConnectionError"))
-        self.assertFalse(module._wayback_allowed())
-        module._wayback_open_until = 0.0
+        module._wayback_probe_required = False
+        module._wayback_probe_active = False
+        try:
+            with mock.patch.object(module.time, "monotonic", return_value=100.0):
+                for _ in range(5):
+                    module._record_wayback_health(module._FetchOutcome(error="ConnectionError"))
+            self.assertEqual(module._wayback_open_until, 100.0 + module.WAYBACK_BREAKER_PAUSE_S)
+            self.assertTrue(module._wayback_probe_required)
+        finally:
+            module._wayback_open_until = 0.0
+            module._wayback_probe_required = False
+            module._wayback_probe_active = False
 
     def test_wayback_breaker_waits_instead_of_skipping_queued_work(self):
         module._wayback_open_until = 160.0
+        module._wayback_probe_required = False
+        module._wayback_probe_active = False
         try:
             with (
                 mock.patch.object(module.time, "monotonic", side_effect=[100.0, 160.0]),
@@ -630,16 +640,56 @@ class ScrapePipelineTests(unittest.TestCase):
             sleep.assert_called_once_with(60.0)
         finally:
             module._wayback_open_until = 0.0
+            module._wayback_probe_required = False
+            module._wayback_probe_active = False
 
     def test_wayback_breaker_wait_honors_clean_shutdown(self):
         stop = threading.Event()
         stop.set()
         module._wayback_open_until = 160.0
+        module._wayback_probe_required = False
+        module._wayback_probe_active = False
         try:
             with mock.patch.object(module.time, "monotonic", return_value=100.0):
                 self.assertFalse(module._wait_for_wayback(stop))
         finally:
             module._wayback_open_until = 0.0
+            module._wayback_probe_required = False
+            module._wayback_probe_active = False
+
+    def test_wayback_half_open_allows_one_probe_then_resumes_after_valid_response(self):
+        module._wayback_open_until = 0.0
+        module._wayback_consecutive_failures = 0
+        module._wayback_probe_required = True
+        module._wayback_probe_active = False
+        try:
+            self.assertTrue(module._wait_for_wayback())
+            self.assertTrue(module._wayback_probe_active)
+            module._record_wayback_health(module._FetchOutcome(status_code=404, error="http_404"))
+            self.assertFalse(module._wayback_probe_required)
+            self.assertFalse(module._wayback_probe_active)
+            self.assertTrue(module._wayback_allowed())
+        finally:
+            module._wayback_open_until = 0.0
+            module._wayback_probe_required = False
+            module._wayback_probe_active = False
+
+    def test_wayback_failed_half_open_probe_uses_long_pause(self):
+        module._wayback_open_until = 0.0
+        module._wayback_consecutive_failures = 0
+        module._wayback_probe_required = True
+        module._wayback_probe_active = False
+        try:
+            self.assertTrue(module._wait_for_wayback())
+            with mock.patch.object(module.time, "monotonic", return_value=100.0):
+                module._record_wayback_health(module._FetchOutcome(error="ConnectionError"))
+            self.assertEqual(module._wayback_open_until, 100.0 + module.WAYBACK_BREAKER_PROBE_FAILURE_PAUSE_S)
+            self.assertTrue(module._wayback_probe_required)
+            self.assertFalse(module._wayback_probe_active)
+        finally:
+            module._wayback_open_until = 0.0
+            module._wayback_probe_required = False
+            module._wayback_probe_active = False
 
     def test_wayback_cdx_failure_reaches_circuit_breaker(self):
         with mock.patch.object(

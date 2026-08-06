@@ -147,7 +147,10 @@ LIVE_DOMAIN_MIN_GAP_S = 0.5
 WAYBACK_MIN_GAP_S = 1.0
 WAYBACK_MAX_SNAPSHOTS = 2
 WAYBACK_BREAKER_FAILURES = 5
-WAYBACK_BREAKER_PAUSE_S = 60
+# A short first pause handles brief provider hiccups.  A failed recovery probe
+# gets a longer pause, so a genuine outage is not repeatedly hammered.
+WAYBACK_BREAKER_PAUSE_S = 20
+WAYBACK_BREAKER_PROBE_FAILURE_PAUSE_S = 60
 
 # Corporate Windows policies commonly block Playwright executables under
 # AppData. Prefer an installed Chrome/Edge channel there, then fall back to the
@@ -1936,6 +1939,8 @@ def _merge_outputs(out_dir: Path) -> Path:
 _wayback_breaker_lock = threading.Lock()
 _wayback_consecutive_failures = 0
 _wayback_open_until = 0.0
+_wayback_probe_required = False
+_wayback_probe_active = False
 
 
 def _wayback_allowed() -> bool:
@@ -1944,18 +1949,26 @@ def _wayback_allowed() -> bool:
 
 
 def _wait_for_wayback(cancel_event: threading.Event | None = None) -> bool:
-    """Wait for an open Wayback circuit breaker instead of skipping queued URLs.
+    """Wait for Wayback or become its single recovery probe.
 
-    ``True`` means the caller may make its Wayback request.  ``False`` means
-    shutdown was requested while waiting.  The wait is shared through the
-    breaker timestamp, so all workers resume together after the single
-    provider-protection pause.
+    ``True`` means the caller may make its Wayback request.  After an open
+    period, exactly one caller receives ``True`` as the half-open probe; other
+    workers wait until that probe either restores or reopens the circuit.
     """
+    global _wayback_probe_active
     while True:
         with _wayback_breaker_lock:
             remaining = _wayback_open_until - time.monotonic()
-        if remaining <= 0:
-            return True
+            if remaining <= 0:
+                if not _wayback_probe_required:
+                    return True
+                if not _wayback_probe_active:
+                    _wayback_probe_active = True
+                    log.info("Wayback circuit breaker half-open: sending one recovery probe")
+                    return True
+                # Another worker owns the one permitted probe.  Polling is
+                # bounded and cancel-aware; it does not make provider calls.
+                remaining = 0.1
         if cancel_event is None:
             time.sleep(remaining)
         elif cancel_event.wait(timeout=remaining):
@@ -1965,19 +1978,40 @@ def _wait_for_wayback(cancel_event: threading.Event | None = None) -> bool:
 def _record_wayback_health(outcome: _FetchOutcome) -> bool:
     """Update the small provider circuit breaker and return provider failure."""
     global _wayback_consecutive_failures, _wayback_open_until
+    global _wayback_probe_required, _wayback_probe_active
     provider_failure = bool(outcome.error) and not str(outcome.error).startswith("http_") and outcome.error not in {"no_capture", "no_archive_url"}
     provider_failure |= outcome.status_code in {429, 502, 503, 504}
     with _wayback_breaker_lock:
+        now = time.monotonic()
         if provider_failure:
-            _wayback_consecutive_failures += 1
-            if _wayback_consecutive_failures >= WAYBACK_BREAKER_FAILURES:
-                _wayback_open_until = time.monotonic() + WAYBACK_BREAKER_PAUSE_S
+            if _wayback_probe_active:
+                _wayback_open_until = now + WAYBACK_BREAKER_PROBE_FAILURE_PAUSE_S
                 _wayback_consecutive_failures = 0
+                _wayback_probe_required = True
+                _wayback_probe_active = False
                 log.warning(
-                    "Wayback circuit breaker pausing queued work for %ss; "
-                    "workers will resume afterward",
-                    WAYBACK_BREAKER_PAUSE_S,
+                    "Wayback recovery probe failed; pausing queued work for %ss",
+                    WAYBACK_BREAKER_PROBE_FAILURE_PAUSE_S,
                 )
+            elif _wayback_open_until <= now:
+                _wayback_consecutive_failures += 1
+                if _wayback_consecutive_failures >= WAYBACK_BREAKER_FAILURES:
+                    _wayback_open_until = now + WAYBACK_BREAKER_PAUSE_S
+                    _wayback_consecutive_failures = 0
+                    _wayback_probe_required = True
+                    log.warning(
+                        "Wayback circuit breaker pausing queued work for %ss; "
+                        "one recovery probe will run afterward",
+                        WAYBACK_BREAKER_PAUSE_S,
+                    )
+        elif _wayback_probe_active:
+            # Any ordinary archive response proves the provider is reachable;
+            # the probe need not recover article text to close the circuit.
+            _wayback_consecutive_failures = 0
+            _wayback_open_until = 0.0
+            _wayback_probe_required = False
+            _wayback_probe_active = False
+            log.info("Wayback recovery probe succeeded; resuming queued work")
         elif outcome.content is not None:
             _wayback_consecutive_failures = 0
         return provider_failure
