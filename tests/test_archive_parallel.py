@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 import unittest
 import uuid
 from contextlib import contextmanager
@@ -170,6 +171,29 @@ def availability_capture(url: str, timestamp="20190101000000"):
 
 
 class ArchiveRoutingTests(unittest.TestCase):
+    def test_failed_recovery_probes_keep_every_endpoint_alive(self):
+        config = archive.ArchiveConfig(
+            request_rate=1_000,
+            breaker_failures=5,
+            breaker_pause_s=0.01,
+        )
+        for endpoint in ("replay", "availability", "cdx"):
+            control = archive.SharedArchiveControl(
+                archive.mp.get_context("spawn"), config
+            )
+            for _ in range(5):
+                control.record_failure(endpoint, probe=False)
+
+            time.sleep(0.02)
+            self.assertTrue(control.acquire(endpoint))
+            control.record_failure(endpoint, probe=True)
+            self.assertTrue(control.snapshot()[endpoint]["probe_pending"])
+
+            time.sleep(0.02)
+            self.assertTrue(control.acquire(endpoint))
+            control.record_healthy(endpoint, probe=True)
+            self.assertFalse(control.snapshot()[endpoint]["probe_pending"])
+
     def test_direct_terminal_result_stops_without_cdx(self):
         row = base_row()
         client = FakeClient([replay_ok(row["url"])], [])
@@ -178,6 +202,49 @@ class ArchiveRoutingTests(unittest.TestCase):
         self.assertFalse(result["needs_archive"])
         self.assertEqual(len(client.replay_calls), 1)
         self.assertEqual(client.cdx_calls, [])
+
+    def test_resume_after_reliable_direct_starts_at_availability(self):
+        row = base_row()
+        row["attempt_trace"] = json.dumps([
+            {"method": "wayback", "phase": "direct", "status": 404},
+        ])
+        client = FakeClient(
+            [replay_ok(row["url"], "20190101000000")], [],
+            availability_outcomes=[availability_capture(row["url"])],
+        )
+        result = archive.process_archive_row(row, client, "resume-test")
+        self.assertFalse(result["needs_archive"])
+        self.assertEqual(client.replay_calls, [
+            (row["url"], "20190101000000", "snapshot"),
+        ])
+        self.assertEqual(len(client.availability_calls), 1)
+
+    def test_resume_after_direct_provider_error_retries_direct(self):
+        row = base_row()
+        row["attempt_trace"] = json.dumps([
+            {"method": "wayback", "phase": "direct", "error": "ReadTimeout"},
+        ])
+        client = FakeClient([replay_ok(row["url"])], [])
+        result = archive.process_archive_row(row, client, "resume-test")
+        self.assertFalse(result["needs_archive"])
+        self.assertEqual(len(client.replay_calls), 1)
+        self.assertEqual(client.replay_calls[0][2], "direct")
+
+    def test_resume_after_reliable_availability_starts_at_cdx(self):
+        row = base_row()
+        row["attempt_trace"] = json.dumps([
+            {"method": "wayback", "phase": "direct", "status": 404},
+            {"method": "wayback", "phase": "availability", "status": 200},
+        ])
+        client = FakeClient(
+            [replay_ok(row["url"], "20190101000000")],
+            [cdx_capture(row["url"])],
+        )
+        result = archive.process_archive_row(row, client, "resume-test")
+        self.assertFalse(result["needs_archive"])
+        self.assertEqual(len(client.availability_calls), 0)
+        self.assertEqual(len(client.cdx_calls), 1)
+        self.assertEqual(client.replay_calls[0][2], "snapshot")
 
     def test_availability_snapshot_is_used_before_cdx(self):
         row = base_row()
@@ -192,7 +259,7 @@ class ArchiveRoutingTests(unittest.TestCase):
         self.assertEqual(client.cdx_calls, [])
         self.assertEqual(len(client.replay_calls), 2)
 
-    def test_valid_empty_availability_variants_do_not_repeat_with_cdx(self):
+    def test_valid_empty_availability_variants_advance_to_cdx(self):
         row = base_row()
         variants = scraper._archive_url_variants([row["url"]])
         client = FakeClient(
@@ -203,7 +270,7 @@ class ArchiveRoutingTests(unittest.TestCase):
         result = archive.process_archive_row(row, client, "test-run")
         self.assertFalse(result["needs_archive"])
         self.assertEqual([call[0] for call in client.availability_calls], variants)
-        self.assertEqual(client.cdx_calls, [])
+        self.assertEqual([call[0] for call in client.cdx_calls], variants)
 
     def test_cdx_variants_are_conditional_and_ordered(self):
         row = base_row()
@@ -617,7 +684,7 @@ class ArchivePersistenceTests(unittest.TestCase):
         finally:
             endpoint.close()
 
-    def test_provider_outage_checkpoints_and_resumes_without_duplicates(self):
+    def test_provider_outage_does_not_terminate_run_and_preserves_deferred_rows(self):
         endpoint = MockWayback()
         endpoint.mode = "fail"
         endpoint.start()
@@ -635,25 +702,28 @@ class ArchivePersistenceTests(unittest.TestCase):
                     cdx_url=f"http://127.0.0.1:{endpoint.port}/cdx",
                     archive_host="127.0.0.1",
                 )
-                with self.assertRaisesRegex(RuntimeError, "stopped safely"):
-                    archive.run_supervisor(
-                        run_dir, manifest, processes=2, threads=4, save_every=10,
-                        checkpoint_age_s=2, max_process_restarts=1, config=config,
-                    )
-                saved_after_failure = archive._saved_rows(run_dir, 8)
-                self.assertGreater(saved_after_failure, 0)
-                self.assertLess(saved_after_failure, 240)
+                def restore_provider():
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        with endpoint.lock:
+                            if endpoint.requests >= 45:
+                                endpoint.mode = "normal"
+                                return
+                        time.sleep(0.01)
+                    raise RuntimeError("test provider did not receive its planned outage calls")
 
-                endpoint.mode = "normal"
-                manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+                restorer = threading.Thread(target=restore_provider)
+                restorer.start()
                 manifest = archive.run_supervisor(
                     run_dir, manifest, processes=2, threads=4, save_every=10,
                     checkpoint_age_s=2, max_process_restarts=1, config=config,
                 )
+                restorer.join()
+                self.assertGreaterEqual(endpoint.requests, 45)
                 final = pl.read_parquet(archive.reduce_run(output, run_dir, manifest))
                 self.assertEqual(final.height, 240)
                 self.assertEqual(final["id"].n_unique(), 240)
-                self.assertEqual(final.filter(pl.col("needs_archive")).height, 0)
+                self.assertGreater(final.filter(pl.col("needs_archive")).height, 0)
         finally:
             endpoint.close()
 
@@ -679,8 +749,7 @@ class ArchivePersistenceTests(unittest.TestCase):
                     run_dir, manifest, processes=2, threads=4, save_every=20,
                     checkpoint_age_s=2, max_process_restarts=1, config=config,
                 )
-                self.assertTrue(manifest["provider"]["cdx"]["unavailable"])
-                self.assertFalse(manifest["provider"]["replay"]["fatal"])
+                self.assertTrue(manifest["provider"]["cdx"]["probe_pending"])
                 final = pl.read_parquet(archive.reduce_run(output, run_dir, manifest))
                 self.assertEqual(final.height, 120)
                 self.assertEqual(final["id"].n_unique(), 120)

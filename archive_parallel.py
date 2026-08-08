@@ -195,15 +195,15 @@ class Capture:
 
 
 class ProviderUnavailable(RuntimeError):
-    """Raised after the half-open replay recovery probe also fails."""
+    """Legacy compatibility exception; provider outages no longer raise it."""
 
 
 class CdxUnavailable(RuntimeError):
-    """Raised when CDX is disabled after its recovery probe fails."""
+    """Legacy compatibility exception; provider outages no longer raise it."""
 
 
 class AvailabilityUnavailable(RuntimeError):
-    """Raised when Availability is disabled after its recovery probe fails."""
+    """Legacy compatibility exception; provider outages no longer raise it."""
 
 
 class SharedArchiveControl:
@@ -235,9 +235,6 @@ class SharedArchiveControl:
         self.availability_pause_until = context.Value("d", 0.0)
         self.availability_probe_required = context.Value("i", 0)
         self.availability_probe_active = context.Value("i", 0)
-        self.fatal_provider = context.Event()
-        self.cdx_unavailable = context.Event()
-        self.availability_unavailable = context.Event()
         self.shutdown = context.Event()
         self.http_attempts = context.Value("q", 0)
         self.replay_healthy = context.Value("q", 0)
@@ -312,12 +309,6 @@ class SharedArchiveControl:
         while True:
             if self.shutdown.is_set():
                 raise InterruptedError("archive run is stopping")
-            if endpoint == "cdx" and self.cdx_unavailable.is_set():
-                raise CdxUnavailable("Wayback CDX recovery probe failed")
-            if endpoint == "availability" and self.availability_unavailable.is_set():
-                raise AvailabilityUnavailable("Wayback Availability recovery probe failed")
-            if endpoint == "replay" and self.fatal_provider.is_set():
-                raise ProviderUnavailable("Wayback replay recovery probe failed")
             with self.lock:
                 _, pause_until, probe_required, probe_active, _, _, _ = self._state(endpoint)
                 now = time.monotonic()
@@ -405,13 +396,18 @@ class SharedArchiveControl:
             failures.value += 1
             if probe:
                 probe_active.value = 0
-                if endpoint == "cdx":
-                    self.cdx_unavailable.set()
-                elif endpoint == "availability":
-                    self.availability_unavailable.set()
-                else:
-                    self.fatal_provider.set()
-                self._emit("probe_failed", endpoint)
+                # A failed half-open probe is a temporary provider condition,
+                # never a reason to disable an endpoint or stop the job. Keep
+                # one future probe pending after another bounded pause.
+                probe_required.value = 1
+                pause_until.value = max(
+                    pause_until.value,
+                    time.monotonic() + self.config.breaker_pause_s,
+                )
+                self._emit(
+                    "probe_failed_retrying", endpoint,
+                    pause_seconds=self.config.breaker_pause_s,
+                )
                 return
             consecutive.value += 1
             if consecutive.value >= self.config.breaker_failures:
@@ -448,22 +444,24 @@ class SharedArchiveControl:
                 "healthy_requests": self.replay_healthy.value,
                 "provider_failures": self.replay_failures.value,
                 "breaker_openings": self.replay_breaker_openings.value,
-                "fatal": self.fatal_provider.is_set(),
+                "paused": self.replay_pause_until.value > time.monotonic(),
+                "probe_pending": bool(self.replay_probe_required.value),
             },
             "cdx": {
                 "healthy_requests": self.cdx_healthy.value,
                 "provider_failures": self.cdx_failures.value,
                 "breaker_openings": self.cdx_breaker_openings.value,
-                "unavailable": self.cdx_unavailable.is_set(),
+                "paused": self.cdx_pause_until.value > time.monotonic(),
+                "probe_pending": bool(self.cdx_probe_required.value),
             },
             "availability": {
                 "healthy_requests": self.availability_healthy.value,
                 "provider_failures": self.availability_failures.value,
                 "breaker_openings": self.availability_breaker_openings.value,
-                "unavailable": self.availability_unavailable.is_set(),
+                "paused": self.availability_pause_until.value > time.monotonic(),
+                "probe_pending": bool(self.availability_probe_required.value),
             },
             "live": live,
-            "fatal_provider": self.fatal_provider.is_set(),
         }
 
 
@@ -776,6 +774,61 @@ def _append_trace(row: Mapping[str, Any], trace: list[dict[str, Any]]) -> str:
     return json.dumps([*prior, *trace], ensure_ascii=False, separators=(",", ":"))
 
 
+def _prior_wayback_trace(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Read prior durable Wayback outcomes without trusting malformed legacy text."""
+    raw = row.get("attempt_trace")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = []
+    return [
+        entry for entry in (raw or [])
+        if isinstance(entry, dict) and entry.get("method") == "wayback"
+    ]
+
+
+def _latest_trace_phase(entries: list[dict[str, Any]], phase: str) -> dict[str, Any] | None:
+    return next((entry for entry in reversed(entries) if entry.get("phase") == phase), None)
+
+
+def _trace_provider_failure(entry: Mapping[str, Any] | None) -> bool:
+    if entry is None:
+        return False
+    error = str(entry.get("error") or "")
+    return (
+        error not in {"", "offsite_redirect", "too_many_redirects"}
+        or entry.get("status") in ArchiveHttpClient.provider_failure_statuses
+    )
+
+
+def _resume_stage(row: Mapping[str, Any]) -> str:
+    """Return the first archive stage not reliably completed for this row.
+
+    A provider/network failure retries its own stage.  A reliable, nonterminal
+    answer advances to the next service, so a new production run never repeats
+    a completed direct replay merely because a later provider was unavailable.
+    """
+    if not bool(row.get("needs_archive")):
+        return "done"
+    entries = _prior_wayback_trace(row)
+    direct = _latest_trace_phase(entries, "direct")
+    if direct is None or _trace_provider_failure(direct):
+        return "direct"
+    availability = _latest_trace_phase(entries, "availability")
+    if availability is None or _trace_provider_failure(availability):
+        return "availability"
+    snapshot = _latest_trace_phase(entries, "snapshot")
+    if snapshot is not None and _trace_provider_failure(snapshot):
+        # The preceding Availability answer records the capture timestamp, so
+        # repeat that lightweight lookup rather than repeating direct replay.
+        return "availability"
+    cdx = _latest_trace_phase(entries, "cdx")
+    if cdx is None or _trace_provider_failure(cdx):
+        return "cdx"
+    return "done"
+
+
 def _attempted_methods(row: Mapping[str, Any]) -> str:
     prior = [part for part in str(row.get("attempted_methods") or "").split(",") if part]
     return ",".join([*prior, "wayback"])
@@ -837,16 +890,30 @@ def process_archive_row(
     client: ArchiveHttpClient,
     run_id: str,
 ) -> dict[str, Any]:
-    """Try direct, Availability, then CDX while preserving the best text."""
+    """Continue the first unfinished archive stage while preserving best text."""
     original = str(row.get("url") or "").strip()
     target = scraper._publication_timestamp(row.get("publish_date"))
     variants = scraper._archive_url_variants([original])
     trace: list[dict[str, Any]] = []
+    resume_stage = _resume_stage(row)
+    if resume_stage == "done":
+        result = dict(row)
+        result.update({
+            "id": str(row.get("id") or ""),
+            "needs_archive": False,
+            "attempted_methods": _attempted_methods(row),
+            "attempt_trace": _append_trace(row, trace),
+            "pipeline_version": ARCHIVE_PIPELINE_VERSION,
+            "pipeline_run_id": run_id,
+            "completed_at": _utc_now(),
+            "playwright_outcome": row.get("playwright_outcome"),
+        })
+        client.metrics.add("rows_completed")
+        return result
     archive_candidates: list[dict[str, Any]] = []
     replayed_timestamps: set[str] = set()
     replay_attempts = 0
     deferred = False
-    availability_definitive = False
 
     def remember(kind: str, variant: str, outcome: HttpOutcome) -> dict[str, Any] | None:
         nonlocal deferred
@@ -871,7 +938,7 @@ def process_archive_row(
         return result
 
     terminal: dict[str, Any] | None = None
-    if variants and target:
+    if resume_stage == "direct" and variants and target:
         direct = client.replay(variants[0], target, kind="direct")
         replay_attempts += 1
         actual_timestamp = _capture_timestamp(direct.final_url)
@@ -888,7 +955,12 @@ def process_archive_row(
         else:
             terminal = None
 
-    if terminal is None and variants and replay_attempts < client.config.max_replays:
+    if (
+        terminal is None
+        and resume_stage in {"direct", "availability"}
+        and variants
+        and replay_attempts < client.config.max_replays
+    ):
         # Availability is much faster and more reliable than CDX in the real
         # comparison.  Variants advance only after a valid empty response.
         for variant in variants:
@@ -916,8 +988,6 @@ def process_archive_row(
             ):
                 deferred = True
                 break
-            if availability_outcome.status_code == 200:
-                availability_definitive = True
             if capture is not None:
                 if (
                     capture.timestamp not in replayed_timestamps
@@ -941,12 +1011,12 @@ def process_archive_row(
             ):
                 break
 
-    # CDX is service redundancy, not a duplicate lookup after a valid
-    # Availability answer.  In the real comparison it added no unique terminal
-    # recovery beyond direct+Availability and had a 60-second p95 lookup.
+    # CDX is the final discovery fallback.  It remains useful when Availability
+    # had a reliable but nonterminal result, and is the correct next stage for
+    # a row that already completed direct and Availability in a prior run.
     if (
         terminal is None
-        and not availability_definitive
+        and resume_stage in {"direct", "availability", "cdx"}
         and variants
         and replay_attempts < client.config.max_replays
     ):
@@ -1430,7 +1500,6 @@ def _process_shard(
             while (
                 len(futures) < threads * 2
                 and not control.shutdown.is_set()
-                and not control.fatal_provider.is_set()
             ):
                 try:
                     row = next(row_iter)
@@ -1465,7 +1534,7 @@ def _process_shard(
     checkpoint()
     if progress_pending:
         status_queue.put(("progress", os.getpid(), shard, progress_pending))
-    if control.shutdown.is_set() or control.fatal_provider.is_set():
+    if control.shutdown.is_set():
         return {"shard": shard, "interrupted": True, "metrics": metrics.snapshot()}
     marker = _finalize_shard(shard, input_path, shard_dir)
     marker["metrics"] = metrics.snapshot()
@@ -1644,10 +1713,6 @@ def run_supervisor(
         last_heartbeat_live = control.snapshot()["live"]
         with tqdm(total=total_rows, initial=initial_rows, desc="Archive", unit="url") as pbar:
             while len(completed) < shard_count and not control.shutdown.is_set():
-                if control.fatal_provider.is_set():
-                    stopping_reason = "provider_recovery_probe_failed"
-                    control.shutdown.set()
-                    break
                 try:
                     kind, pid, shard, payload = status_queue.get(timeout=0.5)
                     if kind == "started":
@@ -1681,18 +1746,12 @@ def run_supervisor(
                                 endpoint, payload.get("failures"), endpoint,
                                 float(payload.get("pause_seconds") or 0),
                             )
-                        elif action == "probe_failed":
-                            if endpoint == "replay":
-                                log.error(
-                                    "Wayback replay recovery probe failed; stopping "
-                                    "safely so pending rows remain resumable"
-                                )
-                            else:
-                                log.warning(
-                                    "Wayback %s became unavailable after its recovery "
-                                    "probe failed; this endpoint is disabled for the run",
-                                    endpoint,
-                                )
+                        elif action == "probe_failed_retrying":
+                            log.warning(
+                                "Wayback %s recovery probe failed; keeping the job alive "
+                                "and retrying one probe after %.0fs",
+                                endpoint, float(payload.get("pause_seconds") or 0),
+                            )
                         elif action == "probe_recovered":
                             log.info("Wayback %s recovery probe succeeded; work resumed", endpoint)
                 except queue.Empty:
