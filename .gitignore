@@ -203,6 +203,14 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Local archive-pipeline benchmark artifacts (scripts/tests remain tracked)
+/tests/archive_parallel_benchmark*/
+/tests/archive_parallel_network_probe*.json
+/tests/wayback_strategy_*.json
+/tests/_archive_tmp_*/
+/archive_runs/
+/scrape_run.lock
+
 # Ruff stuff:
 .ruff_cache/
 
